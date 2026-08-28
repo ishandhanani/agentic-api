@@ -69,8 +69,9 @@ def make_options(**overrides: Any) -> ServeOptions:
 
 
 @pytest.fixture(autouse=True)
-def clear_fake_supervisors() -> None:
+def clear_fake_supervisors(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeSupervisor.instances.clear()
+    monkeypatch.setattr("agentic_api.launcher.sys.platform", "linux")
 
 
 def test_run_serve_local_mode_starts_vllm_then_rust(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,6 +151,31 @@ def test_run_serve_local_mode_checks_packaged_gateway_before_starting_vllm(
     assert launcher.run_serve(make_options()) == 1
     assert supervisor.starts == []
     assert capsys.readouterr().err == "missing gateway\n"
+
+
+def test_run_serve_local_mode_rejects_unsupported_platform_before_discovery(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import agentic_api.launcher as launcher
+
+    supervisor = FakeSupervisor()
+    monkeypatch.setattr(launcher, "ProcessSupervisor", lambda: supervisor)
+    monkeypatch.setattr(launcher.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        launcher,
+        "find_packaged_binary",
+        lambda name: (_ for _ in ()).throw(AssertionError("gateway discovery should not run")),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "find_active_environment_executable",
+        lambda name: (_ for _ in ()).throw(AssertionError("vLLM discovery should not run")),
+    )
+    monkeypatch.setattr(launcher.signal, "signal", lambda sig, handler: handler)
+
+    assert launcher.run_serve(make_options()) == 1
+    assert supervisor.starts == []
+    assert "local mode is currently supported only on Linux" in capsys.readouterr().err
 
 
 def test_run_serve_local_mode_returns_sigint_during_readiness_without_startup_error(

@@ -132,7 +132,7 @@ def _local_health(
     *,
     platform_name: str,
 ) -> tuple[bool, str]:
-    if platform_name != "Linux" and installed_vllm_version == "not installed":
+    if platform_name != "Linux":
         return (
             False,
             "Local mode is currently supported only on Linux because the [local] extra installs vLLM only on Linux. "

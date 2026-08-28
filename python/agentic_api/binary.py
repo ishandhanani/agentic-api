@@ -28,7 +28,7 @@ def find_packaged_binary(name: str) -> Path:
 
 
 def find_active_environment_executable(name: str) -> Path:
-    for candidate in _candidate_paths(name):
+    for candidate in _candidate_paths(name, include_ambient_path=False):
         if _is_executable_file(candidate):
             return candidate
     raise FileNotFoundError(f"{name} executable not found in the active environment")

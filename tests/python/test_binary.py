@@ -6,6 +6,7 @@ import pytest
 
 from agentic_api.binary import (
     PackagedBinaryNotFoundError,
+    find_active_environment_executable,
     find_packaged_binary,
     read_binary_version,
 )
@@ -91,6 +92,24 @@ def test_find_packaged_binary_finds_sibling_of_console_script(
     monkeypatch.setattr("agentic_api.binary.shutil.which", lambda name: None)
 
     assert find_packaged_binary("agentic-server") == packaged_binary
+
+
+def test_find_active_environment_executable_does_not_use_ambient_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    scripts_dir = tmp_path / "env" / "bin"
+    scripts_dir.mkdir(parents=True)
+    ambient_binary = tmp_path / "unrelated" / "vllm"
+    ambient_binary.parent.mkdir(parents=True)
+    ambient_binary.write_text("#!/bin/sh\nexit 0\n")
+    ambient_binary.chmod(0o755)
+
+    monkeypatch.setattr("agentic_api.binary.sysconfig.get_path", lambda name: str(scripts_dir))
+    monkeypatch.setattr("agentic_api.binary.sys.executable", str(tmp_path / "env" / "bin" / "python"))
+    monkeypatch.setattr("agentic_api.binary.shutil.which", lambda name: str(ambient_binary))
+
+    with pytest.raises(FileNotFoundError, match="active environment"):
+        find_active_environment_executable("vllm")
 
 
 def test_read_binary_version_returns_first_line_from_version_output(tmp_path: Path) -> None:

@@ -50,7 +50,7 @@ cargo build
 cargo test
 
 # Python distribution and CLI tests
-.venv/bin/python -m pytest tests/python
+uv run --python 3.12 --with maturin==1.14.1 --with pytest==9.1.1 python -m pytest tests/python
 
 # Source-install CLI E2E (also exercises the packaged wheel build)
 python3 scripts/tests/agentic-cli-e2e-test.py

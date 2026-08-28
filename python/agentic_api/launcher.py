@@ -66,6 +66,11 @@ def run_serve(options: ServeOptions) -> int:
 def _run_local_mode(supervisor: ProcessSupervisor, options: ServeOptions) -> ChildResult:
     if options.model is None:
         raise ValueError("--model is required in local mode")
+    if sys.platform != "linux":
+        raise RuntimeError(
+            "agentic-api local mode is currently supported only on Linux; "
+            "use remote mode on this platform"
+        )
 
     rust_binary = find_packaged_binary("agentic-server")
     vllm_path = find_active_environment_executable("vllm")
