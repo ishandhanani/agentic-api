@@ -1,15 +1,29 @@
 name: Release Python
 
-run-name: Release Python wheels (${{ inputs.version }})
+run-name: Release Python wheels (${{ inputs.version }} from ${{ inputs.source_ref }})
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Build-only Python release version already merged into main"
+        description: "Python release version"
         required: true
         type: string
         default: "0.5.0"
+      source_ref:
+        description: "Git branch, tag, or commit SHA to build"
+        required: true
+        type: string
+        default: "main"
+      publish_target:
+        description: "Where to publish the validated wheels"
+        required: true
+        type: choice
+        options:
+          - artifacts-only
+          - testpypi
+          - pypi
+        default: artifacts-only
 
 concurrency:
   group: release-python-${{ inputs.version }}
@@ -19,10 +33,25 @@ permissions:
   contents: read
 
 jobs:
+  resolve-source:
+    name: Resolve source ref
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Checkout requested source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Record source commit
+        id: source
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   build-wheels:
     name: Build ${{ matrix.target }} wheel artifact
+    needs: resolve-source
     runs-on: ${{ matrix.runs-on }}
-    if: github.ref == 'refs/heads/main'
     env:
       AGENTIC_API_RELEASE_VERSION: ${{ inputs.version }}
     strategy:
@@ -46,8 +75,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve-source.outputs.commit }}
 
-      - name: Verify build-only release gate version
+      - name: Verify release version
         run: scripts/validate-python-release-version.sh
 
       - name: Set up Python
@@ -170,3 +201,52 @@ jobs:
           name: agentic-api-${{ inputs.version }}-${{ matrix.target }}
           path: ${{ steps.build.outputs.wheel_path }}
           if-no-files-found: error
+
+  publish-pypi:
+    name: Publish agentic-api ${{ inputs.version }} to PyPI
+    needs: [resolve-source, build-wheels]
+    if: inputs.publish_target == 'pypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/agentic-api/${{ inputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download validated wheel artifacts
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.2.1
+        with:
+          pattern: agentic-api-${{ inputs.version }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/
+          print-hash: true
+
+  publish-testpypi:
+    name: Publish agentic-api ${{ inputs.version }} to TestPyPI
+    needs: [resolve-source, build-wheels]
+    if: inputs.publish_target == 'testpypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/agentic-api/${{ inputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download validated wheel artifacts
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.2.1
+        with:
+          pattern: agentic-api-${{ inputs.version }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish distributions to TestPyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/
+          repository-url: https://test.pypi.org/legacy/
+          print-hash: true
