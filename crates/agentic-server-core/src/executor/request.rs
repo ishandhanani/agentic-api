@@ -66,7 +66,7 @@ pub struct ExecutionContext {
     /// Base URL for the LLM backend, e.g. `"http://localhost:8000"`.
     pub llm_base_url: String,
     /// Maximum wait time for the next SSE chunk.  `Duration::ZERO` disables the timeout.
-    /// Sourced from [`Config::streaming_chunk_timeout_s`](crate::config::Config::streaming_chunk_timeout_s).
+    /// Sourced from the `STREAMING_CHUNK_TIMEOUT_S` environment variable, defaulting to 600 seconds.
     pub streaming_timeout: Duration,
     storage_pool: Option<Arc<crate::storage::DbPool>>,
 }
@@ -177,9 +177,12 @@ impl ExecutionContext {
 }
 
 fn streaming_timeout_from_env() -> Duration {
-    std::env::var("STREAMING_CHUNK_TIMEOUT_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+    streaming_timeout_from_value(std::env::var("STREAMING_CHUNK_TIMEOUT_S").ok().as_deref())
+}
+
+fn streaming_timeout_from_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
         .map_or(Duration::from_secs(600), Duration::from_secs)
 }
 
@@ -222,7 +225,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{ExecutionContext, database_open_error};
+    use super::{ExecutionContext, database_open_error, streaming_timeout_from_value};
     use crate::executor::{ConversationHandler, ResponseHandler};
     use crate::storage::{ConversationStore, DatabaseBackend, ResponseStore, create_pool_with_schema};
 
@@ -276,6 +279,17 @@ mod tests {
         assert!(message.contains("failed to open PostgreSQL database"));
         assert!(message.contains("postgresql://[redacted]"));
         assert!(!message.contains("postgres-secret"));
+    }
+
+    #[test]
+    fn streaming_timeout_from_value_uses_default_and_supports_disabling() {
+        assert_eq!(streaming_timeout_from_value(None), Duration::from_secs(600));
+        assert_eq!(
+            streaming_timeout_from_value(Some("not-a-number")),
+            Duration::from_secs(600)
+        );
+        assert_eq!(streaming_timeout_from_value(Some("0")), Duration::ZERO);
+        assert_eq!(streaming_timeout_from_value(Some("42")), Duration::from_secs(42));
     }
 
     #[tokio::test]
