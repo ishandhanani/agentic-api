@@ -6,12 +6,13 @@ use clap::{Args, Parser, Subcommand};
 
 use agentic_core::DatabaseBackend;
 use agentic_core::config::{
-    Config, DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS, DEFAULT_POSTGRES_ACQUIRE_TIMEOUT_SECONDS,
+    AgentRtExecutorConfig, Config, DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS, DEFAULT_POSTGRES_ACQUIRE_TIMEOUT_SECONDS,
     DEFAULT_POSTGRES_IDLE_TIMEOUT_SECONDS, DEFAULT_POSTGRES_LOCK_TIMEOUT_SECONDS, DEFAULT_POSTGRES_MAX_CONNECTIONS,
     DEFAULT_POSTGRES_MAX_LIFETIME_SECONDS, DEFAULT_POSTGRES_MIGRATION_TIMEOUT_SECONDS,
     DEFAULT_POSTGRES_STATEMENT_TIMEOUT_SECONDS, DEFAULT_SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
     DEFAULT_SQLITE_MAX_CONNECTIONS, DEFAULT_SQLITE_MMAP_SIZE_BYTES, PostgresConfig, SqliteConfig, SqliteTempStore,
-    ToolRuntimeConfig, WebSearchProviderConfig, default_database_url, ensure_agentic_api_home, normalize_base_url,
+    SubjectSigningKey, ToolRuntimeConfig, WebSearchProviderConfig, default_database_url, ensure_agentic_api_home,
+    normalize_base_url,
 };
 use agentic_core::error::Error;
 use agentic_server::auth::OidcConfig;
@@ -293,9 +294,38 @@ fn build_config(llm_api_base: String, common: &CommonArgs, file: &FileConfig) ->
             mcp_servers: file.mcp_servers.clone(),
             mcp_allowed_hosts,
             messages_gateway_tool_aliases: file.messages_gateway.tool_aliases.clone(),
+            agent_rt: agent_rt_config_from_env()?,
             max_concurrent_gateway_calls,
         },
     })
+}
+
+fn agent_rt_config_from_env() -> Result<Option<AgentRtExecutorConfig>, Error> {
+    let Some(endpoint) = environment_value("AGENT_RT_ENDPOINT") else {
+        return Ok(None);
+    };
+    let required = |name: &'static str| {
+        environment_value(name)
+            .ok_or_else(|| Error::Config(format!("{name} is required when AGENT_RT_ENDPOINT is set")))
+    };
+    let key = required("AGENT_RT_SUBJECT_SIGNING_KEY")?;
+    if key.len() < 32 {
+        return Err(Error::Config(
+            "AGENT_RT_SUBJECT_SIGNING_KEY must contain at least 32 bytes".to_owned(),
+        ));
+    }
+    Ok(Some(AgentRtExecutorConfig {
+        endpoint: normalize_base_url(&endpoint),
+        route_id: environment_value("AGENT_RT_ROUTE_ID").unwrap_or_else(|| "sandbox.python.default".to_owned()),
+        subject_signing_key: SubjectSigningKey::new(key),
+        subject_issuer: environment_value("AGENT_RT_SUBJECT_ISSUER").unwrap_or_else(|| "agentic-api".to_owned()),
+        subject_audience: environment_value("AGENT_RT_SUBJECT_AUDIENCE").unwrap_or_else(|| "agent-rt".to_owned()),
+        tenant_id: required("AGENT_RT_TENANT_ID")?,
+        default_principal_id: required("AGENT_RT_DEFAULT_PRINCIPAL_ID")?,
+        execution_timeout: parse_env_duration("AGENT_RT_EXECUTION_TIMEOUT_SECONDS", 60)?,
+        transport_timeout: parse_env_duration("AGENT_RT_TRANSPORT_TIMEOUT_SECONDS", 5)?,
+        lookup_wait: parse_env_duration("AGENT_RT_LOOKUP_WAIT_SECONDS", 10)?,
+    }))
 }
 
 fn generated_file_config(llm_api_base: String) -> FileConfig {

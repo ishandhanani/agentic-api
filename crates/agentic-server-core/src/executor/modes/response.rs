@@ -133,6 +133,8 @@ mod tests {
             response_id: "resp_test".into(),
             conversation_id: None,
             conversation_version: None,
+            subject: None,
+            execution_cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
 

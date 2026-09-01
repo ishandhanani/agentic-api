@@ -9,7 +9,8 @@ use crate::storage::backend::redact_database_urls;
 use crate::storage::{
     ConversationStore, ConversationVersion, DatabaseBackend, ResponseStore, create_pool_with_schema_and_configs,
 };
-use crate::tool::{GatewayExecutorRegistration, GatewayExecutors};
+use crate::tool::AuthenticatedSubject;
+use crate::tool::{GatewayExecutorRegistration, GatewayExecutors, RemoteAgentRtExecutor};
 use crate::types::io::InputItem;
 use crate::types::messages::GatewayToolMap;
 use crate::types::request_response::{RequestPayload, ResponsePayload};
@@ -36,6 +37,10 @@ pub struct RequestContext {
     /// Conversation version captured with rehydrated history.
     /// `None` for non-conversation and `previous_response_id` execution.
     pub conversation_version: Option<ConversationVersion>,
+    /// Authenticated execution subject for side-effecting built-in tools.
+    pub subject: Option<AuthenticatedSubject>,
+    /// Cancelled when the caller drops an in-flight response stream.
+    pub execution_cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl RequestContext {
@@ -73,6 +78,7 @@ pub struct ExecutionContext {
     /// Bounded-concurrency policy applied to gateway-owned calls in each round.
     pub(crate) gateway_scheduler_policy: GatewaySchedulerPolicy,
     storage_pool: Option<Arc<crate::storage::DbPool>>,
+    remote_default_subject: Option<AuthenticatedSubject>,
 }
 
 impl ExecutionContext {
@@ -106,6 +112,7 @@ impl ExecutionContext {
             streaming_timeout: streaming_timeout_from_env(),
             gateway_scheduler_policy: GatewaySchedulerPolicy::default(),
             storage_pool: None,
+            remote_default_subject: None,
         }
     }
 
@@ -130,6 +137,17 @@ impl ExecutionContext {
     #[must_use]
     pub fn storage_pool(&self) -> Option<&crate::storage::DbPool> {
         self.storage_pool.as_deref()
+    }
+
+    /// Resolves the configured remote-execution tenant with either the
+    /// authenticated OIDC subject or the deployment fallback principal.
+    #[must_use]
+    pub fn remote_execution_subject(&self, authenticated_principal: Option<&str>) -> Option<AuthenticatedSubject> {
+        let mut subject = self.remote_default_subject.clone()?;
+        if let Some(principal) = authenticated_principal {
+            principal.clone_into(&mut subject.principal_id);
+        }
+        Some(subject)
     }
 
     /// Build an `ExecutionContext` directly from [`Config`](crate::config::Config).
@@ -160,8 +178,17 @@ impl ExecutionContext {
         let conv_handler = ConversationHandler::new(ConversationStore::new(pool.clone()));
         let resp_handler = ResponseHandler::new(ResponseStore::new(pool.clone()));
         let client = Arc::new(reqwest::Client::new());
-        let gateway_executors = GatewayExecutors::from_config(Arc::clone(&client), &cfg.tools)
-            .map_err(|error| Error::Config(format!("failed to validate configured MCP server policies: {error}")))?;
+        let mut gateway_executors = GatewayExecutors::from_config(Arc::clone(&client), &cfg.tools)
+            .map_err(|error| Error::Config(format!("failed to validate configured tool executors: {error}")))?;
+        if let Some(agent_rt) = cfg.tools.agent_rt.clone() {
+            let executor = RemoteAgentRtExecutor::new(
+                Arc::clone(&client),
+                agent_rt,
+                crate::storage::RemoteExecutionLedger::new(pool.clone()),
+            )
+            .map_err(|error| Error::Config(format!("failed to configure agent-rt executor: {error}")))?;
+            gateway_executors.register(Arc::new(executor));
+        }
         Ok(Self {
             conv_handler,
             resp_handler,
@@ -175,8 +202,24 @@ impl ExecutionContext {
                 .unwrap_or_default(),
             llm_base_url: cfg.llm_api_base.clone(),
             streaming_timeout: streaming_timeout_from_env(),
-            gateway_scheduler_policy: GatewaySchedulerPolicy::new(cfg.tools.max_concurrent_gateway_calls),
+            gateway_scheduler_policy: cfg.tools.agent_rt.as_ref().map_or_else(
+                || GatewaySchedulerPolicy::new(cfg.tools.max_concurrent_gateway_calls),
+                |agent_rt| {
+                    GatewaySchedulerPolicy::with_timeouts(
+                        cfg.tools.max_concurrent_gateway_calls,
+                        agent_rt.execution_timeout,
+                        agent_rt
+                            .execution_timeout
+                            .saturating_add(agent_rt.transport_timeout)
+                            .saturating_add(agent_rt.lookup_wait),
+                    )
+                },
+            ),
             storage_pool: Some(pool),
+            remote_default_subject: cfg.tools.agent_rt.as_ref().map(|config| AuthenticatedSubject {
+                tenant_id: config.tenant_id.clone(),
+                principal_id: config.default_principal_id.clone(),
+            }),
         })
     }
 }

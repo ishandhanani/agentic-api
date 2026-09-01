@@ -16,6 +16,7 @@ use super::super::common::{
     convert_response, executor_error_response, extract_bearer, read_and_parse, read_json, sse_response,
 };
 use crate::app::AppState;
+use crate::auth::AuthenticatedPrincipal;
 
 async fn proxy_responses(state: &AppState, parts: Parts, body: Bytes) -> Response {
     let proxy_req = ProxyRequest {
@@ -28,8 +29,15 @@ async fn proxy_responses(state: &AppState, parts: Parts, body: Bytes) -> Respons
 
 async fn execute_responses(state: &AppState, parts: Parts, payload: RequestPayload) -> Response {
     let auth = extract_bearer(&parts.headers, state.openai_api_key.as_deref());
+    let subject = state.exec_ctx.remote_execution_subject(
+        parts
+            .extensions
+            .get::<AuthenticatedPrincipal>()
+            .map(AuthenticatedPrincipal::subject),
+    );
     match ExecuteRequest::new(payload, Arc::clone(&state.exec_ctx))
         .with_auth(auth)
+        .with_subject(subject)
         .run()
         .await
     {

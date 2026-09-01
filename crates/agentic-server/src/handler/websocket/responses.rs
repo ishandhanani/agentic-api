@@ -109,17 +109,13 @@ async fn responses_ws_loop(
             break;
         }
 
-        match handle_ws_text(
-            &mut sender,
-            &mut receiver,
-            &state,
-            &headers,
-            &text,
-            &shutdown_token,
-            &mut queue,
-        )
-        .await
-        {
+        let request_context = WsRequestContext {
+            state: &state,
+            headers: &headers,
+            principal: principal.as_ref(),
+            shutdown_token: &shutdown_token,
+        };
+        match handle_ws_text(&mut sender, &mut receiver, request_context, &text, &mut queue).await {
             Ok(()) => {}
             Err(err) => {
                 if !handle_ws_error(&mut sender, err).await {
@@ -196,15 +192,26 @@ where
 ///
 /// Any requests received from the client while the stream is active are
 /// pushed onto `queue` and processed by the caller in order after this returns.
+struct WsRequestContext<'a> {
+    state: &'a AppState,
+    headers: &'a HeaderMap,
+    principal: Option<&'a AuthenticatedPrincipal>,
+    shutdown_token: &'a CancellationToken,
+}
+
 async fn handle_ws_text(
     sender: &mut WsSender,
     receiver: &mut WsReceiver,
-    state: &AppState,
-    headers: &HeaderMap,
+    context: WsRequestContext<'_>,
     text: &str,
-    shutdown_token: &CancellationToken,
     queue: &mut VecDeque<String>,
 ) -> Result<(), WsError> {
+    let WsRequestContext {
+        state,
+        headers,
+        principal,
+        shutdown_token,
+    } = context;
     let value = serde_json::from_str::<Value>(text).map_err(WsError::InvalidJson)?;
 
     if value.get("type").and_then(Value::as_str) != Some("response.create") {
@@ -237,6 +244,11 @@ async fn handle_ws_text(
     let auth = extract_bearer(headers, state.openai_api_key.as_deref());
     let result = ExecuteRequest::new(payload, Arc::clone(&state.exec_ctx))
         .with_auth(auth)
+        .with_subject(
+            state
+                .exec_ctx
+                .remote_execution_subject(principal.map(AuthenticatedPrincipal::subject)),
+        )
         .run()
         .await?;
     let Some(result) = keep_if_running(shutdown_token, result) else {

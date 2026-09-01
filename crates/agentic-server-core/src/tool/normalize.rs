@@ -2,6 +2,7 @@ use crate::types::io::FunctionTool;
 use crate::types::io::input::FunctionToolResultMessage;
 use crate::types::tools::ResponsesTool;
 
+use super::code_interpreter::code_interpreter_function_tool;
 use super::codex::CodexNamespaceHandler;
 use super::custom::CustomHandler;
 use super::function::FunctionHandler;
@@ -73,10 +74,7 @@ impl ResponsesTool {
                 tracing::debug!("file_search tool skipped in normalize - handler not yet registered");
                 vec![]
             }
-            Self::CodeInterpreter(_) => {
-                tracing::debug!("code_interpreter tool skipped in normalize - handler not yet registered");
-                vec![]
-            }
+            Self::CodeInterpreter(_) => vec![code_interpreter_function_tool()],
             Self::Namespace(param) => CodexNamespaceHandler.normalize(param),
             Self::Custom(param) => CustomHandler.normalize(param),
             Self::Unknown => {

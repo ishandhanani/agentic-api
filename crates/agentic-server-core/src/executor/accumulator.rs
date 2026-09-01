@@ -23,7 +23,7 @@ use crate::types::io::{
     ApplyDone, CompactionItem, CustomToolCall, FunctionToolCall, OutputItem, OutputMessage, OutputTextContent,
     ReasoningOutput, ResponseUsage,
 };
-use crate::types::io::{McpCall, WebSearchCall};
+use crate::types::io::{CodeInterpreterCall, McpCall, WebSearchCall};
 use crate::types::request_response::{IncompleteDetails, ResponsePayload};
 use crate::utils::common::{deserialize_from_str, deserialize_from_value_opt};
 use crate::utils::uuid7_str;
@@ -36,6 +36,7 @@ enum InFlight {
     FunctionCall { item: FunctionToolCall, arguments: String },
     CustomToolCall { item: CustomToolCall, input: String },
     WebSearchCall { item: Option<WebSearchCall> },
+    CodeInterpreterCall { item: Option<CodeInterpreterCall> },
     McpCall { item: McpCall },
     McpListTools { item: McpListTools },
     Compaction { item: CompactionItem },
@@ -49,6 +50,7 @@ impl std::fmt::Debug for InFlight {
             Self::FunctionCall { .. } => write!(f, "InFlight::FunctionCall {{ .. }}"),
             Self::CustomToolCall { .. } => write!(f, "InFlight::CustomToolCall {{ .. }}"),
             Self::WebSearchCall { .. } => write!(f, "InFlight::WebSearchCall {{ .. }}"),
+            Self::CodeInterpreterCall { .. } => write!(f, "InFlight::CodeInterpreterCall {{ .. }}"),
             Self::McpCall { .. } => write!(f, "InFlight::McpCall {{ .. }}"),
             Self::McpListTools { .. } => write!(f, "InFlight::McpListTools {{ .. }}"),
             Self::Compaction { .. } => write!(f, "InFlight::Compaction {{ .. }}"),
@@ -82,6 +84,7 @@ impl InFlight {
                 Some(OutputItem::CustomToolCall(item))
             }
             Self::WebSearchCall { item } => item.map(OutputItem::WebSearchCall),
+            Self::CodeInterpreterCall { item } => item.map(OutputItem::CodeInterpreterCall),
             Self::McpCall { item } => Some(OutputItem::McpCall(item)),
             Self::McpListTools { item } => Some(OutputItem::McpListTools(item)),
             Self::Compaction { item } => Some(OutputItem::Compaction(item)),
@@ -478,10 +481,13 @@ impl ResponseAccumulator {
                 text: String::with_capacity(256),
             }),
             SSEItemType::WebSearchCall if !item_id.is_empty() => Some(InFlight::WebSearchCall { item: None }),
+            SSEItemType::CodeInterpreterCall if !item_id.is_empty() => {
+                Some(InFlight::CodeInterpreterCall { item: None })
+            }
             SSEItemType::Compaction => CompactionItem::try_from(payload)
                 .ok()
                 .map(|item| InFlight::Compaction { item }),
-            SSEItemType::WebSearchCall => None,
+            SSEItemType::WebSearchCall | SSEItemType::CodeInterpreterCall => None,
             SSEItemType::McpCall => McpCall::try_from(payload).ok().map(|item| InFlight::McpCall { item }),
             SSEItemType::McpListTools => McpListTools::try_from(payload)
                 .ok()
@@ -553,6 +559,9 @@ impl ResponseAccumulator {
                     }
                     *item = Some(call);
                 }
+                (InFlight::CodeInterpreterCall { item }, Some(OutputItem::CodeInterpreterCall(call))) => {
+                    *item = Some(call);
+                }
                 _ => {}
             }
             return;
@@ -563,6 +572,7 @@ impl ResponseAccumulator {
             | OutputItem::FunctionCall(_)
             | OutputItem::CustomToolCall(_)
             | OutputItem::WebSearchCall(_)
+            | OutputItem::CodeInterpreterCall(_)
             | OutputItem::McpCall(_)
             | OutputItem::McpListTools(_)
             | OutputItem::Compaction(_)),
@@ -655,6 +665,7 @@ fn in_flight_matches_call_type(item: &InFlight, item_type: SSEItemType) -> bool 
         (InFlight::FunctionCall { .. }, SSEItemType::FunctionCall)
             | (InFlight::CustomToolCall { .. }, SSEItemType::CustomToolCall)
             | (InFlight::WebSearchCall { .. }, SSEItemType::WebSearchCall)
+            | (InFlight::CodeInterpreterCall { .. }, SSEItemType::CodeInterpreterCall)
             | (InFlight::McpCall { .. }, SSEItemType::McpCall)
             | (InFlight::McpListTools { .. }, SSEItemType::McpListTools)
             | (InFlight::Compaction { .. }, SSEItemType::Compaction)

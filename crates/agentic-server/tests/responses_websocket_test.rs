@@ -808,6 +808,8 @@ async fn test_websocket_generate_false_prewarm_redacts_mcp_runtime_credentials()
         response_id: "resp_lookup".to_owned(),
         conversation_id: None,
         conversation_version: None,
+        subject: None,
+        execution_cancellation: tokio_util::sync::CancellationToken::new(),
     };
     let stored = fixture
         .state

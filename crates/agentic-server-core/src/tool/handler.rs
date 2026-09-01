@@ -1,5 +1,9 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::types::io::FunctionTool;
 use crate::types::io::output::{FunctionToolCall, GatewayCallStatus, OutputItem};
@@ -8,6 +12,52 @@ use crate::types::io::output::{FunctionToolCall, GatewayCallStatus, OutputItem};
 pub struct ToolOutput {
     pub call_id: String,
     pub output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticatedSubject {
+    pub tenant_id: String,
+    pub principal_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraceContext {
+    pub traceparent: Option<String>,
+    pub tracestate: Option<String>,
+}
+
+/// Request identity and control signals supplied to one gateway-executed
+/// built-in tool call. Local executors may ignore fields they do not need;
+/// side-effecting remote executors must consume the stable execution identity.
+#[derive(Debug, Clone)]
+pub struct GatewayExecutionContext {
+    pub response_id: String,
+    pub conversation_id: Option<String>,
+    pub call_id: String,
+    pub execution_id: String,
+    pub workspace_id: String,
+    pub subject: Option<AuthenticatedSubject>,
+    pub absolute_deadline: Option<SystemTime>,
+    pub cancellation: CancellationToken,
+    pub trace_context: TraceContext,
+}
+
+impl GatewayExecutionContext {
+    pub(crate) fn compatibility(call_id: &str) -> Self {
+        let (execution_id, workspace_id) =
+            crate::storage::remote_execution::stable_execution_identity(None, "compatibility", None, call_id);
+        Self {
+            response_id: "compatibility".to_owned(),
+            conversation_id: None,
+            call_id: call_id.to_owned(),
+            execution_id,
+            workspace_id,
+            subject: None,
+            absolute_deadline: None,
+            cancellation: CancellationToken::new(),
+            trace_context: TraceContext::default(),
+        }
+    }
 }
 
 /// Tool-owned public lifecycle projection for one scheduled gateway call.
@@ -37,6 +87,8 @@ pub enum ToolError {
     Execution(String),
     #[error("invalid tool config: {0}")]
     Config(String),
+    #[error("remote execution outcome is unknown for {execution_id}: {message}")]
+    OutcomeUnknown { execution_id: String, message: String },
     /// A continuation request omitted the output for a pending function call
     /// from the prior turn.
     #[error("No tool output found for function call {call_id}.")]
@@ -101,6 +153,22 @@ pub trait GatewayExecutor: ToolHandler + 'static {
         arguments: &str,
         params: &Self::ExecutionParams,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>>;
+
+    /// Execute with request identity. Existing in-process executors use the
+    /// compatibility default; remote executors override this method.
+    fn execute_with_context(
+        &self,
+        context: GatewayExecutionContext,
+        tool_name: &str,
+        arguments: &str,
+        params: &Self::ExecutionParams,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        let call_id = context.call_id;
+        let tool_name = tool_name.to_owned();
+        let arguments = arguments.to_owned();
+        let params = params.clone();
+        Box::pin(async move { self.execute(&call_id, &tool_name, &arguments, &params).await })
+    }
 
     /// Whether multiple calls to this same model-visible tool name may overlap.
     /// Defaults to `false`, which serializes only same-name calls; calls to

@@ -352,6 +352,33 @@ pub struct WebSearchCall {
     pub action: WebSearchAction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeInterpreterCallStatus {
+    InProgress,
+    Interpreting,
+    Completed,
+    Incomplete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CodeInterpreterOutput {
+    Logs { logs: String },
+    Image { url: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeInterpreterCall {
+    pub id: String,
+    pub code: String,
+    pub container_id: String,
+    #[serde(default)]
+    pub outputs: Vec<CodeInterpreterOutput>,
+    pub status: CodeInterpreterCallStatus,
+}
+
 impl WebSearchCall {
     /// Builds a web-search call from a non-empty query list.
     ///
@@ -810,6 +837,8 @@ pub enum OutputItem {
     CustomToolCall(CustomToolCall),
     #[serde(rename = "web_search_call")]
     WebSearchCall(WebSearchCall),
+    #[serde(rename = "code_interpreter_call")]
+    CodeInterpreterCall(CodeInterpreterCall),
     #[serde(rename = "mcp_call")]
     McpCall(McpCall),
     #[serde(rename = "mcp_list_tools")]
@@ -832,6 +861,7 @@ impl OutputItem {
             Self::CustomToolCall(_) => true,
             Self::Message(_)
             | Self::WebSearchCall(_)
+            | Self::CodeInterpreterCall(_)
             | Self::McpCall(_)
             | Self::McpListTools(_)
             | Self::Reasoning(_)
@@ -853,7 +883,7 @@ impl OutputItem {
             Self::CustomToolCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
             Self::McpListTools(list_tools) => Some(InputItem::McpListTools(list_tools.clone())),
             Self::Compaction(item) => Some(InputItem::Compaction(item.clone())),
-            Self::WebSearchCall(_) | Self::McpCall(_) | Self::Unknown => None,
+            Self::WebSearchCall(_) | Self::CodeInterpreterCall(_) | Self::McpCall(_) | Self::Unknown => None,
         }
     }
 }

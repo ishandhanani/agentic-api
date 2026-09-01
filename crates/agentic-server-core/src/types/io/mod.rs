@@ -9,10 +9,11 @@ pub use input::{
     ResponsesInput, ToolCallOutput, ToolOutputContent,
 };
 pub use output::{
-    ApplyDone, CustomToolCall, FunctionToolCall, GatewayCallStatus, McpCall, McpCallError, McpCallStatus,
-    McpToolExecutionError, McpToolExecutionErrorContent, OutputItem, OutputMessage, OutputTextContent, ReasoningOutput,
-    ReasoningTextContent, WebSearchAction, WebSearchActionError, WebSearchActionFindInPage, WebSearchActionOpenPage,
-    WebSearchActionSearch, WebSearchCall, WebSearchCallStatus, WebSearchSource,
+    ApplyDone, CodeInterpreterCall, CodeInterpreterCallStatus, CodeInterpreterOutput, CustomToolCall, FunctionToolCall,
+    GatewayCallStatus, McpCall, McpCallError, McpCallStatus, McpToolExecutionError, McpToolExecutionErrorContent,
+    OutputItem, OutputMessage, OutputTextContent, ReasoningOutput, ReasoningTextContent, WebSearchAction,
+    WebSearchActionError, WebSearchActionFindInPage, WebSearchActionOpenPage, WebSearchActionSearch, WebSearchCall,
+    WebSearchCallStatus, WebSearchSource,
 };
 pub use tools::{AllowedTool, AllowedToolsMode, FunctionTool, ToolChoice};
 pub(crate) use tools::{resolve_tool_choice, resolve_tools};

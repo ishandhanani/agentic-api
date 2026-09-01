@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::handler::{GatewayExecutor, GatewayToolEventPlan, ToolError, ToolOutput};
+use super::handler::{GatewayExecutionContext, GatewayExecutor, GatewayToolEventPlan, ToolError, ToolOutput};
 use crate::types::io::OutputItem;
 use crate::types::io::output::{FunctionToolCall, GatewayCallStatus};
 
@@ -14,7 +14,7 @@ use crate::types::io::output::{FunctionToolCall, GatewayCallStatus};
 trait ErasedGatewayExecutor: Send + Sync {
     fn execute(
         &self,
-        call_id: &str,
+        context: GatewayExecutionContext,
         tool_name: &str,
         arguments: &str,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>>;
@@ -43,11 +43,12 @@ where
 {
     fn execute(
         &self,
-        call_id: &str,
+        context: GatewayExecutionContext,
         tool_name: &str,
         arguments: &str,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        self.executor.execute(call_id, tool_name, arguments, &self.params)
+        self.executor
+            .execute_with_context(context, tool_name, arguments, &self.params)
     }
 
     fn plan_gateway_events(&self, call: &FunctionToolCall) -> GatewayToolEventPlan {
@@ -99,11 +100,11 @@ impl GatewayBinding {
 
     pub(crate) fn execute(
         &self,
-        call_id: &str,
+        context: GatewayExecutionContext,
         tool_name: &str,
         arguments: &str,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        self.executor.execute(call_id, tool_name, arguments)
+        self.executor.execute(context, tool_name, arguments)
     }
 
     #[must_use]
