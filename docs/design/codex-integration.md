@@ -155,7 +155,7 @@ For response items:
 
 ## Continuation
 
-Codex-owned tool calls must survive response-store continuation.
+Codex tool calls returned for client execution must survive response-store continuation.
 
 Expected rehydration shape:
 

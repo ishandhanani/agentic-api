@@ -841,8 +841,8 @@ impl OutputItem {
     }
 
     /// Shapes a stored output item as continuation input.
-    /// Gateway-owned public tool output is omitted because its model-facing
-    /// function call and result are persisted separately as input items. MCP
+    /// Public output for gateway-executed built-in tools is omitted because the model-facing
+    /// function call and output are persisted separately as input items. MCP
     /// list metadata is retained here and removed by `ResponsesInput::model_input`.
     #[must_use]
     pub fn to_input_item(&self) -> Option<InputItem> {
