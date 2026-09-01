@@ -13,6 +13,13 @@ All notable changes to Agentic API are documented here.
 - Preserved MCP list-tools records in continuation history for registry lifecycle
   decisions while excluding them from model input, preventing repeated public
   list-tools emission on later turns.
+- Aligned the Codex integration design with the preferred client-executed and
+  gateway-executed tool terminology.
+
+### Fixed
+
+- Made web-search action construction return a typed error for empty query lists
+  instead of panicking.
 
 ### Added
 
