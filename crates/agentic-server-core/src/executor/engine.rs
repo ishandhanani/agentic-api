@@ -453,6 +453,12 @@ async fn run_blocking(
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
 ) -> ExecutorResult<ResponsePayload> {
+    // Axum drops the handler future when a blocking client disconnects. Keep
+    // the same cancel-on-drop contract as the streaming path so an accepted
+    // remote execution receives best-effort cancellation instead of being
+    // abandoned until its deadline.
+    let cancellation = ctx.execution_cancellation.clone();
+    let _cancel_on_drop = cancellation.drop_guard();
     let (payload, ctx) = run_until_gateway_tools_complete(ctx, exec_ctx, auth, false, None).await?;
 
     let ch = exec_ctx.conv_handler.clone();

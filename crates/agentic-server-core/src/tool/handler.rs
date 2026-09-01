@@ -178,6 +178,17 @@ pub trait GatewayExecutor: ToolHandler + 'static {
         false
     }
 
+    /// Whether this executor owns its authoritative deadline and recovery.
+    ///
+    /// The gateway must not drop such an executor behind a generic local
+    /// timeout: doing so could abandon a remote side effect without lookup or
+    /// cancellation. Executors returning `true` must bound their own work and
+    /// reconcile ambiguous transport outcomes before returning.
+    #[must_use]
+    fn manages_execution_deadline(&self) -> bool {
+        false
+    }
+
     /// Plans the typed public lifecycle for one gateway call.
     ///
     /// The returned plan must not assign protocol indexes or construct SSE

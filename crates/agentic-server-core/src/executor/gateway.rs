@@ -368,7 +368,7 @@ impl GatewayScheduler {
             trace_context: crate::tool::TraceContext::default(),
         };
 
-        let dispatched = if self.timeout.is_zero() {
+        let dispatched = if self.timeout.is_zero() || binding.manages_execution_deadline {
             binding.execute(context, &call.name, &call.arguments).await
         } else {
             match tokio::time::timeout(self.timeout, binding.execute(context, &call.name, &call.arguments)).await {
@@ -833,6 +833,53 @@ mod tests {
         }
     }
 
+    struct DeadlineManagedSlowExecutor;
+
+    impl ToolHandler for DeadlineManagedSlowExecutor {
+        type ToolParams = WebSearchToolParam;
+
+        fn tool_type(&self) -> ToolType {
+            ToolType::WebSearch
+        }
+
+        fn validate(&self, _params: &WebSearchToolParam) -> Result<(), ToolError> {
+            Ok(())
+        }
+
+        fn normalize(&self, _params: &WebSearchToolParam) -> Vec<FunctionTool> {
+            Vec::new()
+        }
+    }
+
+    impl GatewayExecutor for DeadlineManagedSlowExecutor {
+        type ExecutionParams = WebSearchToolParam;
+
+        fn execute(
+            &self,
+            call_id: &str,
+            _tool_name: &str,
+            _arguments: &str,
+            _params: &WebSearchToolParam,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let call_id = call_id.to_owned();
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                Ok(ToolOutput {
+                    call_id,
+                    output: "authoritative".to_owned(),
+                })
+            })
+        }
+
+        fn supports_parallel_execution(&self) -> bool {
+            true
+        }
+
+        fn manages_execution_deadline(&self) -> bool {
+            true
+        }
+    }
+
     fn web_search_call(call_id: &str) -> FunctionToolCall {
         FunctionToolCall {
             id: format!("fc_{call_id}"),
@@ -878,6 +925,33 @@ mod tests {
             body.contains("timed out"),
             "error output should mention the timeout: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn deadline_managed_call_is_not_dropped_by_generic_timeout() {
+        let web_search: ResponsesTool =
+            serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
+        let mut executors = GatewayExecutors::default();
+        executors.insert(Arc::new(DeadlineManagedSlowExecutor));
+        let mut tools = [web_search];
+        let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
+            .await
+            .expect("registry builds");
+        let output_items = [OutputItem::FunctionCall(web_search_call("call_managed"))];
+        let mut scheduler =
+            GatewayScheduler::plan_with_test_timeout(&output_items, &registry, 0, std::time::Duration::from_millis(1));
+
+        let result = scheduler
+            .execute()
+            .await
+            .expect("deadline-managed executor completes authoritatively")
+            .remove(0);
+        let InputItem::FunctionCallOutput(output) = result.input_item else {
+            panic!("expected a function_call_output");
+        };
+        let body = serde_json::to_string(&output).expect("serialize output");
+        assert!(body.contains("authoritative"));
+        assert!(!body.contains("timed out"));
     }
 
     #[tokio::test]

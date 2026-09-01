@@ -64,10 +64,19 @@ impl RemoteAgentRtExecutor {
 
     async fn execute_remote(&self, context: GatewayExecutionContext, arguments: &str) -> Result<ToolOutput, ToolError> {
         let (link, request, token) = self.prepare_execution(&context, arguments).await?;
+        let mut cancel_on_drop = RemoteCancelOnDrop::new(
+            Arc::clone(&self.client),
+            self.endpoint().to_owned(),
+            self.config.transport_timeout,
+            link.execution_id.clone(),
+            token.clone(),
+        );
         let record = self
             .start_or_recover(&link, &request, &token, context.trace_context.traceparent.as_deref())
             .await?;
-        self.await_terminal(&context, &link, &token, record).await
+        let outcome = self.await_terminal(&context, &link, &token, record).await;
+        cancel_on_drop.disarm();
+        outcome
     }
 
     async fn prepare_execution(
@@ -384,6 +393,66 @@ impl RemoteAgentRtExecutor {
     }
 }
 
+/// Sends best-effort cancellation when an in-flight remote executor future is
+/// dropped before it classifies an authoritative outcome. This covers caller
+/// disconnect, task abort, and runtime-local timeout without relying on the
+/// dropped future being polled again.
+struct RemoteCancelOnDrop {
+    client: Option<Arc<reqwest::Client>>,
+    endpoint: String,
+    transport_timeout: Duration,
+    execution_id: String,
+    token: String,
+}
+
+impl RemoteCancelOnDrop {
+    fn new(
+        client: Arc<reqwest::Client>,
+        endpoint: String,
+        transport_timeout: Duration,
+        execution_id: String,
+        token: String,
+    ) -> Self {
+        Self {
+            client: Some(client),
+            endpoint,
+            transport_timeout,
+            execution_id,
+            token,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.client = None;
+    }
+}
+
+impl Drop for RemoteCancelOnDrop {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let endpoint = std::mem::take(&mut self.endpoint);
+        let execution_id = std::mem::take(&mut self.execution_id);
+        let token = std::mem::take(&mut self.token);
+        let transport_timeout = self.transport_timeout;
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(async move {
+            let result = client
+                .post(format!("{endpoint}/internal/v1/executions/{execution_id}:cancel"))
+                .bearer_auth(token)
+                .timeout(transport_timeout)
+                .send()
+                .await;
+            if let Err(error) = result {
+                tracing::debug!(%execution_id, %error, "best-effort agent-rt cancellation failed");
+            }
+        });
+    }
+}
+
 impl ToolHandler for RemoteAgentRtExecutor {
     type ToolParams = CodeInterpreterToolParam;
 
@@ -429,6 +498,10 @@ impl GatewayExecutor for RemoteAgentRtExecutor {
     }
 
     fn supports_parallel_execution(&self) -> bool {
+        true
+    }
+
+    fn manages_execution_deadline(&self) -> bool {
         true
     }
 
@@ -669,6 +742,7 @@ enum RemoteTransportError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::extract::{Path, State};
@@ -691,6 +765,15 @@ mod tests {
         request: Arc<Mutex<Option<serde_json::Value>>>,
         post_count: Arc<AtomicUsize>,
         lookup_count: Arc<AtomicUsize>,
+        cancel_count: Arc<AtomicUsize>,
+        start_seen: Arc<tokio::sync::Notify>,
+    }
+
+    #[derive(Clone)]
+    struct RestartAgentRtState {
+        known_executions: Arc<Mutex<HashSet<String>>>,
+        physical_starts: Arc<AtomicUsize>,
+        post_attempts: Arc<AtomicUsize>,
     }
 
     async fn delayed_start(
@@ -723,6 +806,62 @@ mod tests {
         Ok(axum::Json(completed_record(&request)))
     }
 
+    async fn accepted_start(
+        State(state): State<FakeAgentRtState>,
+        axum::Json(request): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        state.post_count.fetch_add(1, Ordering::SeqCst);
+        *state.request.lock().await = Some(request.clone());
+        state.start_seen.notify_one();
+        axum::Json(nonterminal_record(&request, "accepted", 1))
+    }
+
+    async fn running_lookup(
+        State(state): State<FakeAgentRtState>,
+        Path(execution_id): Path<String>,
+    ) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
+        state.lookup_count.fetch_add(1, Ordering::SeqCst);
+        let Some(request) = state.request.lock().await.clone() else {
+            return Err(axum::http::StatusCode::NOT_FOUND);
+        };
+        assert_eq!(request["execution_id"], execution_id);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(axum::Json(nonterminal_record(&request, "running", 2)))
+    }
+
+    async fn cancel_execution(
+        State(state): State<FakeAgentRtState>,
+        Path(execution_action): Path<String>,
+    ) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
+        let execution_id = execution_action
+            .strip_suffix(":cancel")
+            .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+        state.cancel_count.fetch_add(1, Ordering::SeqCst);
+        let Some(request) = state.request.lock().await.clone() else {
+            return Err(axum::http::StatusCode::NOT_FOUND);
+        };
+        assert_eq!(request["execution_id"], execution_id);
+        Ok(axum::Json(nonterminal_record(&request, "cancelled", 3)))
+    }
+
+    fn nonterminal_record(request: &serde_json::Value, state: &str, revision: u64) -> serde_json::Value {
+        serde_json::json!({
+            "api_version": "v1",
+            "execution_id": request["execution_id"],
+            "workspace_id": request["workspace_id"],
+            "route_id": request["route_id"],
+            "route_version": "blake3:route-v1",
+            "request_fingerprint": "blake3:agent-rt-fingerprint",
+            "revision": revision,
+            "state": state,
+            "result": null,
+            "failure": null,
+            "artifacts": [],
+            "accepted_at": "2026-09-01T00:00:00Z",
+            "completed_at": null
+        })
+    }
+
     fn completed_record(request: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "api_version": "v1",
@@ -743,6 +882,18 @@ mod tests {
             "accepted_at": "2026-09-01T00:00:00Z",
             "completed_at": "2026-09-01T00:00:01Z"
         })
+    }
+
+    async fn create_or_get_after_restart(
+        State(state): State<RestartAgentRtState>,
+        axum::Json(request): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        state.post_attempts.fetch_add(1, Ordering::SeqCst);
+        let execution_id = request["execution_id"].as_str().expect("execution ID").to_owned();
+        if state.known_executions.lock().await.insert(execution_id) {
+            state.physical_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        axum::Json(completed_record(&request))
     }
 
     #[tokio::test]
@@ -849,6 +1000,193 @@ mod tests {
             public.outputs.as_slice(),
             [CodeInterpreterOutput::Logs { logs }] if logs == "42\n"
         ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dropping_in_flight_remote_execution_sends_best_effort_cancel() {
+        let fake = FakeAgentRtState::default();
+        let app = axum::Router::new()
+            .route("/internal/v1/executions", post(accepted_start))
+            .route(
+                "/internal/v1/executions/{execution_id}",
+                get(running_lookup).post(cancel_execution),
+            )
+            .with_state(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake agent-rt");
+        let address = listener.local_addr().expect("fake agent-rt address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let pool = crate::storage::create_pool_with_schema(Some("sqlite::memory:"))
+            .await
+            .expect("create execution ledger");
+        let executor = RemoteAgentRtExecutor::new(
+            Arc::new(reqwest::Client::new()),
+            AgentRtExecutorConfig {
+                endpoint: format!("http://{address}"),
+                route_id: "sandbox.python.default".to_owned(),
+                subject_signing_key: crate::config::SubjectSigningKey::new(
+                    "0123456789abcdef0123456789abcdef".to_owned(),
+                ),
+                subject_issuer: "agentic-api".to_owned(),
+                subject_audience: "agent-rt".to_owned(),
+                tenant_id: "tenant-a".to_owned(),
+                default_principal_id: "principal-a".to_owned(),
+                execution_timeout: Duration::from_secs(30),
+                transport_timeout: Duration::from_millis(250),
+                lookup_wait: Duration::from_secs(5),
+            },
+            RemoteExecutionLedger::new(pool),
+        )
+        .expect("remote executor");
+        let subject = crate::tool::AuthenticatedSubject {
+            tenant_id: "tenant-a".to_owned(),
+            principal_id: "principal-a".to_owned(),
+        };
+        let (execution_id, workspace_id) = crate::storage::remote_execution::stable_execution_identity(
+            Some(&subject),
+            "resp-cancel",
+            Some("conv-cancel"),
+            "call-cancel",
+        );
+        let context = GatewayExecutionContext {
+            response_id: "resp-cancel".to_owned(),
+            conversation_id: Some("conv-cancel".to_owned()),
+            call_id: "call-cancel".to_owned(),
+            execution_id,
+            workspace_id,
+            subject: Some(subject),
+            absolute_deadline: Some(SystemTime::now() + Duration::from_secs(30)),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            trace_context: crate::tool::TraceContext::default(),
+        };
+
+        let execution =
+            tokio::spawn(async move { executor.execute_remote(context, r#"{"code":"while True: pass"}"#).await });
+        tokio::time::timeout(Duration::from_secs(2), fake.start_seen.notified())
+            .await
+            .expect("remote start was not accepted");
+        execution.abort();
+        let _ = execution.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fake.cancel_count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("best-effort cancel was not sent");
+        assert_eq!(fake.cancel_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.post_count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn process_restart_reuses_durable_ledger_and_existing_remote_execution() {
+        let subject = crate::tool::AuthenticatedSubject {
+            tenant_id: "tenant-a".to_owned(),
+            principal_id: "principal-a".to_owned(),
+        };
+        let (execution_id, workspace_id) = crate::storage::remote_execution::stable_execution_identity(
+            Some(&subject),
+            "resp-restart",
+            Some("conv-restart"),
+            "call-restart",
+        );
+        let code = "print(42)";
+        let fingerprint = request_fingerprint("sandbox.python.default", &workspace_id, code);
+        let database_path = std::env::temp_dir().join(format!("agentic-api-restart-{}.db", uuid::Uuid::now_v7()));
+        let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+        let first_pool = crate::storage::create_pool_with_schema(Some(&database_url))
+            .await
+            .expect("create durable execution ledger");
+        let first_ledger = RemoteExecutionLedger::new(first_pool.clone());
+        let first_link = first_ledger
+            .claim(crate::storage::ClaimRemoteExecution {
+                subject: &subject,
+                response_id: "resp-restart",
+                conversation_id: Some("conv-restart"),
+                call_id: "call-restart",
+                route_id: "sandbox.python.default",
+                request_fingerprint: &fingerprint,
+                absolute_deadline: unix_seconds_i64() + 30,
+            })
+            .await
+            .expect("first process durably claimed call before dispatch");
+        assert_eq!(first_link.execution_id, execution_id);
+        drop(first_ledger);
+        first_pool.close().await;
+
+        let state = RestartAgentRtState {
+            known_executions: Arc::new(Mutex::new(HashSet::from([execution_id.clone()]))),
+            physical_starts: Arc::new(AtomicUsize::new(1)),
+            post_attempts: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = axum::Router::new()
+            .route("/internal/v1/executions", post(create_or_get_after_restart))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake agent-rt");
+        let address = listener.local_addr().expect("fake agent-rt address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let recovered_pool = crate::storage::create_pool_with_schema(Some(&database_url))
+            .await
+            .expect("reopen execution ledger after process restart");
+        let executor = RemoteAgentRtExecutor::new(
+            Arc::new(reqwest::Client::new()),
+            AgentRtExecutorConfig {
+                endpoint: format!("http://{address}"),
+                route_id: "sandbox.python.default".to_owned(),
+                subject_signing_key: crate::config::SubjectSigningKey::new(
+                    "0123456789abcdef0123456789abcdef".to_owned(),
+                ),
+                subject_issuer: "agentic-api".to_owned(),
+                subject_audience: "agent-rt".to_owned(),
+                tenant_id: "tenant-a".to_owned(),
+                default_principal_id: "principal-a".to_owned(),
+                execution_timeout: Duration::from_secs(30),
+                transport_timeout: Duration::from_millis(250),
+                lookup_wait: Duration::from_millis(10),
+            },
+            RemoteExecutionLedger::new(recovered_pool.clone()),
+        )
+        .expect("recovered remote executor");
+        let context = GatewayExecutionContext {
+            response_id: "resp-restart".to_owned(),
+            conversation_id: Some("conv-restart".to_owned()),
+            call_id: "call-restart".to_owned(),
+            execution_id,
+            workspace_id,
+            subject: Some(subject),
+            absolute_deadline: Some(SystemTime::now() + Duration::from_secs(30)),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            trace_context: crate::tool::TraceContext::default(),
+        };
+
+        executor
+            .execute_remote(context, r#"{"code":"print(42)"}"#)
+            .await
+            .expect("restarted process reconciles existing physical execution");
+        assert_eq!(state.post_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(state.physical_starts.load(Ordering::SeqCst), 1);
+        let ledger_state: String = sqlx::query_scalar("SELECT state FROM remote_executions")
+            .fetch_one(recovered_pool.as_ref())
+            .await
+            .expect("recovered process persisted terminal state");
+        assert_eq!(ledger_state, "completed");
+        recovered_pool.close().await;
+        std::fs::remove_file(&database_path).expect("remove restart test database");
+        for suffix in ["-shm", "-wal"] {
+            let sidecar = format!("{}{suffix}", database_path.display());
+            if std::path::Path::new(&sidecar).exists() {
+                std::fs::remove_file(sidecar).expect("remove SQLite restart sidecar");
+            }
+        }
         server.abort();
     }
 }
