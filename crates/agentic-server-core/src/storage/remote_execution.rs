@@ -27,6 +27,7 @@ pub struct ClaimRemoteExecution<'a> {
     pub response_id: &'a str,
     pub conversation_id: Option<&'a str>,
     pub call_id: &'a str,
+    pub workspace_id: &'a str,
     pub route_id: &'a str,
     pub request_fingerprint: &'a str,
     pub absolute_deadline: i64,
@@ -69,12 +70,7 @@ impl RemoteExecutionLedger {
         &self,
         claim: ClaimRemoteExecution<'_>,
     ) -> Result<RemoteExecutionLink, RemoteExecutionLedgerError> {
-        let (execution_id, workspace_id) = stable_execution_identity(
-            Some(claim.subject),
-            claim.response_id,
-            claim.conversation_id,
-            claim.call_id,
-        );
+        let execution_id = stable_execution_id(Some(claim.subject), claim.response_id, claim.call_id);
         let now = utcnow_str();
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
@@ -91,7 +87,7 @@ impl RemoteExecutionLedger {
         .bind(claim.conversation_id)
         .bind(claim.call_id)
         .bind(&execution_id)
-        .bind(&workspace_id)
+        .bind(claim.workspace_id)
         .bind(claim.route_id)
         .bind(claim.request_fingerprint)
         .bind(claim.absolute_deadline)
@@ -102,6 +98,7 @@ impl RemoteExecutionLedger {
             .await?
             .ok_or(RemoteExecutionLedgerError::NotFound)?;
         if link.route_id != claim.route_id
+            || link.workspace_id != claim.workspace_id
             || link.request_fingerprint != claim.request_fingerprint
             || link.conversation_id.as_deref() != claim.conversation_id
         {
@@ -206,17 +203,23 @@ pub(crate) fn stable_execution_identity(
     conversation_id: Option<&str>,
     call_id: &str,
 ) -> (String, String) {
+    let execution_id = stable_execution_id(subject, response_id, call_id);
     let tenant_id = subject.map_or("", |subject| subject.tenant_id.as_str());
     let principal_id = subject.map_or("", |subject| subject.principal_id.as_str());
-    let execution_id = stable_id("exec_", &[tenant_id, principal_id, response_id, call_id]);
     let workspace_basis = conversation_id.unwrap_or(response_id);
     let workspace_id = stable_id("ws_", &[tenant_id, principal_id, workspace_basis]);
     (execution_id, workspace_id)
 }
 
+fn stable_execution_id(subject: Option<&AuthenticatedSubject>, response_id: &str, call_id: &str) -> String {
+    let tenant_id = subject.map_or("", |subject| subject.tenant_id.as_str());
+    let principal_id = subject.map_or("", |subject| subject.principal_id.as_str());
+    stable_id("exec_", &[tenant_id, principal_id, response_id, call_id])
+}
+
 fn stable_id(prefix: &str, components: &[&str]) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"agentic-api-remote-execution-v1");
+    hasher.update(b"agentic-api-remote-execution");
     for component in components {
         hasher.update(&(component.len() as u64).to_le_bytes());
         hasher.update(component.as_bytes());
@@ -248,6 +251,7 @@ mod tests {
             response_id: "resp-a",
             conversation_id: Some("conv-a"),
             call_id: "call-a",
+            workspace_id: "ws-explicit",
             route_id: "sandbox.python.default",
             request_fingerprint: "blake3:request-a",
             absolute_deadline: 2_000_000_000,
@@ -257,6 +261,7 @@ mod tests {
         let second = ledger.claim(claim()).await.expect("idempotent claim");
         assert_eq!(first.execution_id, second.execution_id);
         assert_eq!(first.workspace_id, second.workspace_id);
+        assert_eq!(first.workspace_id, "ws-explicit");
         assert_eq!(second.absolute_deadline, 2_000_000_000);
 
         let conflict = ledger

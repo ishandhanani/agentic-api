@@ -3,6 +3,10 @@
 // Database URL classification and sanitization
 pub mod backend;
 
+// Public container metadata and pagination; physical lifecycle remains in agent-rt.
+pub(crate) mod container;
+pub(crate) mod container_file;
+
 // Strong types for storage operations (newtype pattern)
 pub mod types;
 
@@ -26,6 +30,8 @@ pub mod conversation;
 
 // Re-export commonly used types for convenience
 pub use backend::DatabaseBackend;
+pub(crate) use container::{ClaimContainer, ContainerOrder, ContainerRecord, ContainerStore};
+pub(crate) use container_file::{ClaimContainerFile, ContainerFileRecord, ContainerFileStore};
 pub use conversation::ConversationStore;
 pub use models::Conversation as DbConversation;
 pub use models::Item;

@@ -93,6 +93,8 @@ pub enum ResponsesTool {
     FileSearch(FileSearchToolParam),
     #[serde(rename = "code_interpreter")]
     CodeInterpreter(CodeInterpreterToolParam),
+    #[serde(rename = "shell")]
+    Shell(ShellToolParam),
     #[serde(rename = "namespace")]
     Namespace(CodexNamespaceToolParam),
     /// A freeform tool declaration. Unlike a function tool, calls carry raw
@@ -231,6 +233,115 @@ pub struct FileSearchToolParam {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodeInterpreterToolParam {}
 
+/// Execution environment requested for the native shell tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ShellEnvironmentParam {
+    Local {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skills: Vec<ShellLocalSkillParam>,
+    },
+    ContainerAuto {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        file_ids: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        memory_limit: Option<ShellMemoryLimitParam>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        network_policy: Option<ShellNetworkPolicyParam>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skills: Vec<ShellSkillParam>,
+    },
+    ContainerReference {
+        container_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellMemoryLimitParam {
+    #[serde(rename = "1g")]
+    OneGiB,
+    #[serde(rename = "4g")]
+    FourGiB,
+    #[serde(rename = "16g")]
+    SixteenGiB,
+    #[serde(rename = "64g")]
+    SixtyFourGiB,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ShellNetworkPolicyParam {
+    Disabled,
+    Allowlist {
+        allowed_domains: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        domain_secrets: Vec<ShellDomainSecretParam>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellDomainSecretParam {
+    pub domain: String,
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ShellSkillParam {
+    SkillReference {
+        skill_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+    },
+    Inline {
+        description: String,
+        name: String,
+        source: ShellInlineSkillSourceParam,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ShellInlineSkillSourceParam {
+    Base64 {
+        data: String,
+        media_type: ShellInlineSkillMediaTypeParam,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellInlineSkillMediaTypeParam {
+    #[serde(rename = "application/zip")]
+    ApplicationZip,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellLocalSkillParam {
+    pub description: String,
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellAllowedCallerParam {
+    Direct,
+    Programmatic,
+}
+
+/// Parameters for the Responses native shell tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellToolParam {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<ShellEnvironmentParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_callers: Option<Vec<ShellAllowedCallerParam>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexNamespaceToolParam {
     pub name: String,
@@ -261,6 +372,7 @@ impl ResponsesTool {
             Self::WebSearch(_) => Some("web_search_preview"),
             Self::FileSearch(_) => Some("file_search"),
             Self::CodeInterpreter(_) => Some("code_interpreter"),
+            Self::Shell(_) => Some("shell"),
             Self::Namespace(_) => Some("namespace"),
             Self::Custom(_) => Some("custom"),
             Self::Unknown => None,

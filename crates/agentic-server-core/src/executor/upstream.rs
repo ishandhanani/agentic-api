@@ -77,7 +77,8 @@ pub(super) async fn fetch_stream_payload(
         exec_ctx.streaming_timeout,
     ));
     let mut acc = ResponseAccumulator::new(ctx.response_id.clone(), ctx.conversation_id.clone());
-    let mut function_sse = FunctionSseTranslator::new(registry.tool_type_map());
+    let mut function_sse =
+        FunctionSseTranslator::new(registry.tool_type_map()).with_client_owned_names(registry.client_owned_names());
     let mut defer_from_output_index = None;
     let mut deferred_events = Vec::new();
     let mut deferred_bytes = 0;
@@ -268,7 +269,7 @@ fn emit_mcp_discovery_lifecycle(
     let event_plans = mcp_list_tools_event_plans(&public_output, 0);
 
     emit_gateway_start_events(&event_plans, stream_accumulator, stream_sender)?;
-    emit_gateway_completed_events(&public_output, &event_plans, stream_accumulator, stream_sender)
+    emit_gateway_completed_events(&event_plans, stream_accumulator, stream_sender)
 }
 
 fn is_terminal_response_event(event_type: SSEEventType) -> bool {

@@ -2,13 +2,13 @@ use crate::types::io::FunctionTool;
 use crate::types::io::input::FunctionToolResultMessage;
 use crate::types::tools::ResponsesTool;
 
-use super::code_interpreter::code_interpreter_function_tool;
 use super::codex::CodexNamespaceHandler;
 use super::custom::CustomHandler;
 use super::function::FunctionHandler;
 use super::handler::{ToolError, ToolHandler, ToolOutput};
 use super::mcp::McpHandler;
 use super::registry::ToolType;
+use super::shell::shell_function_tool;
 use super::web_search::web_search_function_tool;
 
 impl ResponsesTool {
@@ -22,7 +22,9 @@ impl ResponsesTool {
         match self {
             Self::Function(param) => FunctionHandler.validate(param),
             Self::Mcp(param) => McpHandler::spec_from_param(param).validate(param),
-            Self::WebSearch(_) | Self::FileSearch(_) | Self::CodeInterpreter(_) | Self::Unknown => Ok(()),
+            Self::WebSearch(_) | Self::FileSearch(_) | Self::CodeInterpreter(_) | Self::Shell(_) | Self::Unknown => {
+                Ok(())
+            }
             Self::Namespace(param) => CodexNamespaceHandler.validate(param),
             Self::Custom(param) => CustomHandler.validate(param),
         }
@@ -37,6 +39,7 @@ impl ResponsesTool {
             Self::WebSearch(_) => Some(ToolType::WebSearch),
             Self::FileSearch(_) => Some(ToolType::FileSearch),
             Self::CodeInterpreter(_) => Some(ToolType::CodeInterpreter),
+            Self::Shell(_) => Some(ToolType::Shell),
             Self::Namespace(_) => Some(ToolType::CodexNamespace),
             Self::Custom(_) => Some(ToolType::Custom),
             Self::Unknown => None,
@@ -45,7 +48,14 @@ impl ResponsesTool {
 
     #[must_use]
     pub fn is_gateway_owned(&self) -> bool {
-        self.tool_type().is_some_and(ToolType::is_gateway_owned)
+        match self {
+            Self::Mcp(_) | Self::WebSearch(_) | Self::FileSearch(_) | Self::CodeInterpreter(_) => true,
+            Self::Shell(params) => !matches!(
+                params.environment,
+                Some(crate::types::tools::ShellEnvironmentParam::Local { .. })
+            ),
+            Self::Function(_) | Self::Namespace(_) | Self::Custom(_) | Self::Unknown => false,
+        }
     }
 
     /// Normalise function-like tool declarations to the `FunctionTool` wire format that vLLM understands.
@@ -75,6 +85,7 @@ impl ResponsesTool {
                 vec![]
             }
             Self::CodeInterpreter(_) => vec![code_interpreter_function_tool()],
+            Self::Shell(_) => vec![shell_function_tool()],
             Self::Namespace(param) => CodexNamespaceHandler.normalize(param),
             Self::Custom(param) => CustomHandler.normalize(param),
             Self::Unknown => {
@@ -82,6 +93,24 @@ impl ResponsesTool {
                 vec![]
             }
         }
+    }
+}
+
+#[must_use]
+pub(crate) fn code_interpreter_function_tool() -> FunctionTool {
+    FunctionTool {
+        type_: "function".to_owned(),
+        name: "code_interpreter".to_owned(),
+        description: Some("Execute Python code in an operator-managed sandbox.".to_owned()),
+        parameters: Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Python source code to execute."}
+            },
+            "required": ["code"],
+            "additionalProperties": false
+        })),
+        strict: Some(true),
     }
 }
 

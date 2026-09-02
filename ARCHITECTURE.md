@@ -136,6 +136,11 @@ a coding harness (Codex or Claude Code) as subprocesses for local, single-comman
 | `POST /v1/responses` | `responses` | `handler/http/responses.rs` |
 | `POST /v1/responses/compact` | `compact_response` | `handler/http/responses.rs` |
 | `POST /v1/conversations` | `conversations` | `handler/http/conversations.rs` |
+| `POST`, `GET /v1/containers` | `create_container`, `list_containers` | `handler/http/containers.rs` |
+| `GET`, `DELETE /v1/containers/{container_id}` | `retrieve_container`, `delete_container` | `handler/http/containers.rs` |
+| `POST`, `GET /v1/containers/{container_id}/files` | `create_container_file`, `list_container_files` | `handler/http/containers.rs` |
+| `GET`, `DELETE /v1/containers/{container_id}/files/{file_id}` | `retrieve_container_file`, `delete_container_file` | `handler/http/containers.rs` |
+| `GET /v1/containers/{container_id}/files/{file_id}/content` | `retrieve_container_file_content` | `handler/http/containers.rs` |
 | `POST /v1/messages` | `messages` | `handler/http/messages.rs` |
 | `POST /v1/messages/count_tokens` | `count_tokens` | `handler/http/messages.rs` |
 | `GET /v1/models` | `models` | `handler/http/models.rs` |
@@ -149,6 +154,8 @@ Handlers make a request-scoped decision between two paths:
   `run_messages_stream` (Messages) against `state.exec_ctx`.
 - **Transparent proxy path** — everything else is forwarded to vLLM unchanged via
   `agentic_core::proxy`, with no state, no persistence.
+
+Container handlers are a third, explicit adapter path. Agentic API owns the subject-scoped public container/file catalog and pagination; a configured agent-rt service owns physical workspace lifecycle and file I/O over gRPC. Container identity is independent from Responses and conversation identity. Unsupported dynamic workspace policies fail validation instead of leaking provider configuration into the public API.
 
 ### WebSocket transport (`handler/websocket/`)
 

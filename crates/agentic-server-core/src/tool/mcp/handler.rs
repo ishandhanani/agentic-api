@@ -270,23 +270,23 @@ impl GatewayExecutor for McpHandler {
     }
 
     fn plan_gateway_events(&self, call: &FunctionToolCall, params: &McpDiscoveredToolParam) -> GatewayToolEventPlan {
-        GatewayToolEventPlan::new(Some(started_output_item(call, &params.server_label, &params.tool_name)))
+        GatewayToolEventPlan::one(Some(started_output_item(call, &params.server_label, &params.tool_name)))
     }
 
-    fn public_output(
+    fn public_outputs(
         &self,
         call: &FunctionToolCall,
         output: &ToolOutput,
         status: GatewayCallStatus,
         params: &McpDiscoveredToolParam,
-    ) -> Option<OutputItem> {
-        Some(output_item(
+    ) -> Vec<OutputItem> {
+        vec![output_item(
             call,
             output,
             status,
             &params.server_label,
             &params.tool_name,
-        ))
+        )]
     }
 }
 

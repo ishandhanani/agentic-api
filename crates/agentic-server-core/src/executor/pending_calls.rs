@@ -16,6 +16,7 @@ use crate::types::io::InputItem;
 enum CallKind {
     Function,
     Custom,
+    Shell,
 }
 
 impl CallKind {
@@ -23,6 +24,7 @@ impl CallKind {
         match self {
             Self::Function => "function_call",
             Self::Custom => "custom_tool_call",
+            Self::Shell => "shell_call",
         }
     }
 
@@ -30,6 +32,7 @@ impl CallKind {
         match self {
             Self::Function => "function_call_output",
             Self::Custom => "custom_tool_call_output",
+            Self::Shell => "shell_call_output",
         }
     }
 }
@@ -56,11 +59,17 @@ pub(super) fn pending_calls(items: &[InputItem]) -> ExecutorResult<Vec<PendingCa
             InputItem::CustomToolCall(call) => {
                 add_call(&call.call_id, CallKind::Custom, &mut seen_call_ids, &mut pending)?;
             }
+            InputItem::ShellCall(call) => {
+                add_call(&call.call_id, CallKind::Shell, &mut seen_call_ids, &mut pending)?;
+            }
             InputItem::FunctionCallOutput(output) => {
                 resolve_call(&output.call_id, CallKind::Function, &mut pending)?;
             }
             InputItem::CustomToolCallOutput(output) => {
                 resolve_call(&output.call_id, CallKind::Custom, &mut pending)?;
+            }
+            InputItem::ShellCallOutput(output) => {
+                resolve_call(&output.call_id, CallKind::Shell, &mut pending)?;
             }
             InputItem::Message(_)
             | InputItem::Reasoning(_)

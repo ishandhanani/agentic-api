@@ -5,13 +5,14 @@ pub mod usage;
 
 pub use input::{
     CompactionItem, CustomToolCallOutputMessage, FunctionToolResultMessage, InputContent, InputFileContent,
-    InputFunctionToolCall, InputImageContent, InputItem, InputMessage, InputMessageContent, InputTextContent,
-    ResponsesInput, ToolCallOutput, ToolOutputContent,
+    InputFunctionToolCall, InputImageContent, InputItem, InputMessage, InputMessageContent, InputShellCall,
+    InputTextContent, ResponsesInput, ShellCallOutputMessage, ToolCallOutput, ToolOutputContent,
 };
 pub use output::{
     ApplyDone, CodeInterpreterCall, CodeInterpreterCallStatus, CodeInterpreterOutput, CustomToolCall, FunctionToolCall,
     GatewayCallStatus, McpCall, McpCallError, McpCallStatus, McpToolExecutionError, McpToolExecutionErrorContent,
-    OutputItem, OutputMessage, OutputTextContent, ReasoningOutput, ReasoningTextContent, WebSearchAction,
+    OutputItem, OutputMessage, OutputTextContent, ReasoningOutput, ReasoningTextContent, ShellCall, ShellCallAction,
+    ShellCallEnvironment, ShellCallOutcome, ShellCallOutput, ShellCallOutputContent, ShellCallStatus, WebSearchAction,
     WebSearchActionError, WebSearchActionFindInPage, WebSearchActionOpenPage, WebSearchActionSearch, WebSearchCall,
     WebSearchCallStatus, WebSearchSource,
 };

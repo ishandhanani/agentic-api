@@ -31,6 +31,7 @@ pub enum ToolType {
     WebSearch,
     FileSearch,
     CodeInterpreter,
+    Shell,
 }
 
 impl ToolType {
@@ -44,16 +45,8 @@ impl ToolType {
             Self::WebSearch => "web search tool",
             Self::FileSearch => "file search tool",
             Self::CodeInterpreter => "code interpreter tool",
+            Self::Shell => "shell tool",
         }
-    }
-
-    /// Whether this kind of tool is gateway-owned by design, independent of
-    /// any specific registry entry. Used before a `ToolEntry` exists (e.g.
-    /// classifying a raw declaration); once an entry exists, prefer
-    /// `ToolOwnership::is_gateway` on it directly.
-    #[must_use]
-    pub const fn is_gateway_owned(self) -> bool {
-        !matches!(self, Self::Function | Self::Custom | Self::CodexNamespace)
     }
 }
 
@@ -77,11 +70,9 @@ impl std::fmt::Debug for ToolEntry {
 }
 
 impl ToolEntry {
-    /// Builds a client-owned entry. `tool_type.is_gateway_owned()` is the
-    /// single source of truth for the ownership discriminant; this asserts
-    /// the caller picked the constructor matching its own tool type.
+    /// Builds a client-owned entry. Ownership is request-specific: notably,
+    /// local Shell is client-owned while container Shell is gateway-owned.
     pub(crate) fn client(tool_type: ToolType, server_label: Option<String>) -> Self {
-        debug_assert!(!tool_type.is_gateway_owned());
         Self {
             tool_type,
             server_label,
@@ -92,7 +83,6 @@ impl ToolEntry {
     /// Builds a gateway-owned entry. `binding` is `None` for tool types that
     /// are gateway-owned in principle but have no executor yet.
     pub(crate) fn gateway(tool_type: ToolType, server_label: Option<String>, binding: Option<GatewayBinding>) -> Self {
-        debug_assert!(tool_type.is_gateway_owned());
         Self {
             tool_type,
             server_label,
@@ -146,6 +136,17 @@ fn insert_code_interpreter_entry(entries: &mut HashMap<String, ToolEntry>, bindi
         "code_interpreter".to_owned(),
         ToolEntry::gateway(ToolType::CodeInterpreter, None, binding),
     );
+}
+
+fn insert_gateway_shell_entry(entries: &mut HashMap<String, ToolEntry>, binding: GatewayBinding) {
+    entries.insert(
+        "shell".to_owned(),
+        ToolEntry::gateway(ToolType::Shell, None, Some(binding)),
+    );
+}
+
+fn insert_client_shell_entry(entries: &mut HashMap<String, ToolEntry>) {
+    entries.insert("shell".to_owned(), ToolEntry::client(ToolType::Shell, None));
 }
 
 /// Request-scoped registry built from `RequestPayload.tools`.
@@ -248,6 +249,24 @@ impl ToolRegistry {
                         insert_code_interpreter_entry(resolved, Some(binding));
                     })?;
                 }
+                ResponsesTool::Shell(p) => {
+                    if matches!(
+                        p.environment,
+                        Some(crate::types::tools::ShellEnvironmentParam::Local { .. })
+                    ) {
+                        crate::tool::shell::validate_client_shell(p)?;
+                        insert_unique_tool_entries(&mut entries, insert_client_shell_entry)?;
+                    } else {
+                        let binding = executors.binding(ToolType::Shell, p)?.ok_or_else(|| {
+                            ToolError::Config(
+                                "container shell requires an operator-configured gateway executor".to_owned(),
+                            )
+                        })?;
+                        insert_unique_tool_entries(&mut entries, |resolved| {
+                            insert_gateway_shell_entry(resolved, binding);
+                        })?;
+                    }
+                }
                 ResponsesTool::Namespace(p) => {
                     insert_unique_tool_entries(&mut entries, |resolved| insert_namespace_entries(resolved, p))?;
                 }
@@ -280,6 +299,14 @@ impl ToolRegistry {
         self.entries
             .iter()
             .map(|(name, entry)| (name.clone(), entry.tool_type))
+            .collect()
+    }
+
+    pub(crate) fn client_owned_names(&self) -> std::collections::HashSet<String> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| !entry.ownership.is_gateway())
+            .map(|(name, _)| name.clone())
             .collect()
     }
 
@@ -364,6 +391,13 @@ impl ToolRegistry {
             .is_some_and(|entry| entry.tool_type == ToolType::Custom)
     }
 
+    #[must_use]
+    pub fn is_client_shell_name(&self, name: &str) -> bool {
+        self.entries
+            .get(name)
+            .is_some_and(|entry| entry.tool_type == ToolType::Shell && !entry.ownership.is_gateway())
+    }
+
     /// Returns the subset of `calls` whose names map to client-owned tools
     /// (`Function`, Codex namespace members, or unknown names).
     #[must_use]
@@ -420,7 +454,7 @@ mod tests {
         }
 
         fn normalize(&self, _params: &Self::ToolParams) -> Vec<crate::types::io::FunctionTool> {
-            vec![crate::tool::code_interpreter::code_interpreter_function_tool()]
+            vec![crate::tool::normalize::code_interpreter_function_tool()]
         }
     }
 

@@ -316,6 +316,8 @@ fn agent_rt_config_from_env() -> Result<Option<AgentRtExecutorConfig>, Error> {
     }
     Ok(Some(AgentRtExecutorConfig {
         endpoint: normalize_base_url(&endpoint),
+        workspace_class_id: environment_value("AGENT_RT_WORKSPACE_CLASS_ID")
+            .unwrap_or_else(|| "python.default".to_owned()),
         route_id: environment_value("AGENT_RT_ROUTE_ID").unwrap_or_else(|| "sandbox.python.default".to_owned()),
         subject_signing_key: SubjectSigningKey::new(key),
         subject_issuer: environment_value("AGENT_RT_SUBJECT_ISSUER").unwrap_or_else(|| "agentic-api".to_owned()),

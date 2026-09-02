@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package agent_rt.control;
+
+service WorkspaceService {
+  rpc CreateWorkspace(CreateWorkspaceRequest) returns (Workspace);
+  rpc GetWorkspace(GetWorkspaceRequest) returns (Workspace);
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (Workspace);
+}
+
+service ExecutionService {
+  rpc StartExecution(StartExecutionRequest) returns (Execution);
+  rpc GetExecution(GetExecutionRequest) returns (Execution);
+  rpc CancelExecution(CancelExecutionRequest) returns (Execution);
+  rpc WatchExecution(WatchExecutionRequest) returns (stream Execution);
+}
+
+service WorkspaceFileService {
+  rpc StatFile(StatFileRequest) returns (FileMetadata);
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+  rpc ReadFile(ReadFileRequest) returns (FileChunk);
+  rpc WriteFile(WriteFileRequest) returns (FileMetadata);
+  rpc RemoveFile(RemoveFileRequest) returns (RemoveFileResponse);
+}
+
+service ArtifactService {
+  rpc GetArtifact(GetArtifactRequest) returns (ArtifactMetadata);
+  rpc ReadArtifact(ReadArtifactRequest) returns (stream ArtifactChunk);
+}
+
+// Advisory demand ingestion for the independent capacity planner. Reports are
+// authenticated and resolve operator-owned routes; provider and pool identity
+// never appear in this caller-facing contract.
+service CapacityService {
+  rpc ReportCapacityIntent(ReportCapacityIntentRequest) returns (CapacityIntent);
+}
+
+message CreateWorkspaceRequest {
+  string workspace_id = 1;
+  string workspace_class_id = 2;
+}
+
+message GetWorkspaceRequest {
+  string workspace_id = 1;
+}
+
+message DeleteWorkspaceRequest {
+  string workspace_id = 1;
+}
+
+message Workspace {
+  string workspace_id = 1;
+  string workspace_class_id = 2;
+  string workspace_class_revision = 3;
+  WorkspaceState state = 4;
+  uint64 revision = 5;
+  uint64 created_at_unix_millis = 6;
+  uint64 last_active_at_unix_millis = 7;
+  optional uint64 expires_at_unix_millis = 8;
+  repeated Capability capabilities = 9;
+  optional string failure_code = 10;
+}
+
+message Capability {
+  string name = 1;
+  uint32 version = 2;
+}
+
+enum WorkspaceState {
+  WORKSPACE_STATE_UNSPECIFIED = 0;
+  WORKSPACE_STATE_CREATING = 1;
+  WORKSPACE_STATE_READY = 2;
+  WORKSPACE_STATE_SUSPENDED = 3;
+  WORKSPACE_STATE_DELETING = 4;
+  WORKSPACE_STATE_DELETED = 5;
+  WORKSPACE_STATE_FAILED = 6;
+}
+
+message StartExecutionRequest {
+  string execution_id = 1;
+  string workspace_id = 2;
+  string route_id = 3;
+  Command command = 4;
+  uint64 absolute_deadline_unix_millis = 5;
+  ExecutionLimits limits = 6;
+  map<string, string> client_metadata = 7;
+}
+
+message Command {
+  repeated string argv = 1;
+  optional string cwd = 2;
+  map<string, string> env = 3;
+  bytes stdin = 4;
+  repeated string artifact_paths = 5;
+  // Logical workspace user selected from the operator-owned workspace class.
+  // When absent, the class/provider default is used.
+  optional string user = 6;
+}
+
+message ExecutionLimits {
+  optional uint64 max_output_bytes = 1;
+  optional uint64 max_artifact_bytes = 2;
+}
+
+message GetExecutionRequest {
+  string execution_id = 1;
+}
+
+message CancelExecutionRequest {
+  string execution_id = 1;
+}
+
+message WatchExecutionRequest {
+  string execution_id = 1;
+  uint64 after_revision = 2;
+}
+
+message Execution {
+  string execution_id = 1;
+  string workspace_id = 2;
+  string route_id = 3;
+  uint64 revision = 4;
+  ExecutionState state = 5;
+  optional ExecutionResult result = 6;
+  optional string failure_code = 7;
+  repeated ArtifactMetadata artifacts = 8;
+  uint64 accepted_at_unix_millis = 9;
+  optional uint64 completed_at_unix_millis = 10;
+}
+
+enum ExecutionState {
+  EXECUTION_STATE_UNSPECIFIED = 0;
+  EXECUTION_STATE_ACCEPTED = 1;
+  EXECUTION_STATE_RUNNING = 2;
+  EXECUTION_STATE_SUCCEEDED = 3;
+  EXECUTION_STATE_FAILED = 4;
+  EXECUTION_STATE_CANCELLED = 5;
+  EXECUTION_STATE_TIMED_OUT = 6;
+  EXECUTION_STATE_OUTCOME_UNKNOWN = 7;
+}
+
+message ExecutionResult {
+  optional int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+  bool output_truncated = 4;
+}
+
+message StatFileRequest {
+  string workspace_id = 1;
+  string path = 2;
+  optional string user = 3;
+}
+
+message ListFilesRequest {
+  string workspace_id = 1;
+  string path = 2;
+  optional string user = 3;
+}
+
+message ListFilesResponse {
+  repeated FileMetadata files = 1;
+}
+
+message ReadFileRequest {
+  string workspace_id = 1;
+  string path = 2;
+  uint64 offset = 3;
+  uint64 max_bytes = 4;
+  optional string user = 5;
+}
+
+message FileChunk {
+  bytes data = 1;
+  uint64 next_offset = 2;
+  bool eof = 3;
+}
+
+message WriteFileRequest {
+  string workspace_id = 1;
+  string path = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+  bool truncate = 5;
+  optional string user = 6;
+}
+
+message RemoveFileRequest {
+  string workspace_id = 1;
+  string path = 2;
+  bool recursive = 3;
+  optional string user = 4;
+}
+
+message RemoveFileResponse {}
+
+message FileMetadata {
+  string path = 1;
+  uint64 size_bytes = 2;
+  bool is_directory = 3;
+  optional uint64 modified_at_unix_millis = 4;
+}
+
+message GetArtifactRequest {
+  string execution_id = 1;
+  string artifact_id = 2;
+}
+
+message ReadArtifactRequest {
+  string execution_id = 1;
+  string artifact_id = 2;
+}
+
+message ArtifactMetadata {
+  string artifact_id = 1;
+  string name = 2;
+  uint64 size_bytes = 3;
+  optional string media_type = 4;
+}
+
+message ArtifactChunk {
+  bytes data = 1;
+  uint64 offset = 2;
+  bool eof = 3;
+}
+
+message ReportCapacityIntentRequest {
+  string source_id = 1;
+  string route_id = 2;
+  uint64 slots = 3;
+  uint32 confidence_per_million = 4;
+  uint64 ready_by_unix_millis = 5;
+  uint64 expires_at_unix_millis = 6;
+  uint64 expected_duration_millis = 7;
+}
+
+message CapacityIntent {
+  string source_id = 1;
+  string route_id = 2;
+  uint64 slots = 3;
+  uint32 confidence_per_million = 4;
+  uint64 ready_by_unix_millis = 5;
+  uint64 expires_at_unix_millis = 6;
+  uint64 expected_duration_millis = 7;
+  uint64 revision = 8;
+  uint64 accepted_at_unix_millis = 9;
+}

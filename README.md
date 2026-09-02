@@ -67,6 +67,7 @@ flowchart LR
 | `POST /v1/responses` | OpenAI-compatible Responses API with state, tools, and streaming | ✅ |
 | `GET /v1/responses` | WebSocket transport for the Responses API | ✅ |
 | `POST /v1/conversations` | Conversation management | ✅ |
+| `/v1/containers` · `/v1/containers/{id}/files` | Container lifecycle and file I/O through a configured agent-rt service | 🚧 Policy bindings |
 | `GET /v1/models` | Model listing proxied from vLLM | ✅ |
 | `GET /health` · `GET /ready` | Liveness and readiness probes | ✅ |
 | Messages API | Anthropic-style stateful messages on shared primitives | 🚧 Planned |
@@ -366,8 +367,8 @@ Every tool call has exactly one execution path, so nothing runs by accident:
 
 | Ownership | Who executes it | Examples |
 | --- | --- | --- |
-| **Gateway-owned** | Agentic API executes it server-side and continues the loop | Web search, file search, MCP-backed tools |
-| **Client-owned** | Preserved and returned to the client | Codex shell / editor tools, your functions |
+| **Gateway-owned** | Agentic API executes it server-side and continues the loop | Web search, MCP-backed tools, native Shell in an agent-rt container |
+| **Client-owned** | Preserved and returned to the client | Native local Shell, Codex shell / editor tools, your functions |
 | **Provider-owned** | Passed through to vLLM or an upstream provider | Provider-native tools |
 
 Unknown or ambiguous tool shapes are **never executed by default**. They are preserved and returned.

@@ -21,12 +21,12 @@ trait ErasedGatewayExecutor: Send + Sync {
 
     fn plan_gateway_events(&self, call: &FunctionToolCall) -> GatewayToolEventPlan;
 
-    fn public_output(
+    fn public_outputs(
         &self,
         call: &FunctionToolCall,
         output: &ToolOutput,
         status: GatewayCallStatus,
-    ) -> Option<OutputItem>;
+    ) -> Vec<OutputItem>;
 }
 
 struct TypedGatewayExecutor<E>
@@ -55,13 +55,13 @@ where
         self.executor.plan_gateway_events(call, &self.params)
     }
 
-    fn public_output(
+    fn public_outputs(
         &self,
         call: &FunctionToolCall,
         output: &ToolOutput,
         status: GatewayCallStatus,
-    ) -> Option<OutputItem> {
-        self.executor.public_output(call, output, status, &self.params)
+    ) -> Vec<OutputItem> {
+        self.executor.public_outputs(call, output, status, &self.params)
     }
 }
 
@@ -119,13 +119,13 @@ impl GatewayBinding {
     }
 
     #[must_use]
-    pub(crate) fn public_output(
+    pub(crate) fn public_outputs(
         &self,
         call: &FunctionToolCall,
         output: &ToolOutput,
         status: GatewayCallStatus,
-    ) -> Option<OutputItem> {
-        self.executor.public_output(call, output, status)
+    ) -> Vec<OutputItem> {
+        self.executor.public_outputs(call, output, status)
     }
 }
 

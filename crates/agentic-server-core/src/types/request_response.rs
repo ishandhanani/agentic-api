@@ -302,6 +302,8 @@ impl From<&ResponsesInput> for Vec<InputItem> {
                     InputItem::CustomToolCallOutput(output) => {
                         Some(InputItem::FunctionCallOutput(output.clone().into()))
                     }
+                    InputItem::ShellCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
+                    InputItem::ShellCallOutput(output) => Some(InputItem::FunctionCallOutput(output.clone().into())),
                     item => Some(item.clone()),
                 })
                 .collect(),
@@ -324,6 +326,8 @@ impl From<ResponsesInput> for Vec<InputItem> {
                     InputItem::Unknown => None,
                     InputItem::CustomToolCall(call) => Some(InputItem::FunctionCall(call.into())),
                     InputItem::CustomToolCallOutput(output) => Some(InputItem::FunctionCallOutput(output.into())),
+                    InputItem::ShellCall(call) => Some(InputItem::FunctionCall(call.into())),
+                    InputItem::ShellCallOutput(output) => Some(InputItem::FunctionCallOutput(output.into())),
                     item => Some(item),
                 })
                 .collect(),

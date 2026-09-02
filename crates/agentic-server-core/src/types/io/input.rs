@@ -6,7 +6,10 @@ use serde_json::Value;
 use crate::types::event::MessageStatus;
 use crate::utils::common::deserialize_from_value;
 
-use super::output::{CustomToolCall, FunctionToolCall, McpListTools, ReasoningOutput};
+use super::output::{
+    CustomToolCall, FunctionToolCall, McpListTools, ReasoningOutput, ShellCall, ShellCallAction, ShellCallEnvironment,
+    ShellCallOutput, ShellCallOutputContent, ShellCallStatus,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputTextContent {
@@ -167,6 +170,52 @@ impl From<CustomToolCall> for InputFunctionToolCall {
     }
 }
 
+impl From<ShellCall> for InputFunctionToolCall {
+    fn from(call: ShellCall) -> Self {
+        Self {
+            id: Some(call.id),
+            call_id: call.call_id,
+            name: "shell".to_owned(),
+            namespace: None,
+            arguments: serde_json::to_string(&call.action).expect("shell call action serializes"),
+            status: Some(match call.status {
+                ShellCallStatus::InProgress | ShellCallStatus::Completed => MessageStatus::Completed,
+                ShellCallStatus::Incomplete => MessageStatus::InProgress,
+            }),
+        }
+    }
+}
+
+/// A native shell call replayed as input. Server-populated fields remain
+/// optional so stateless clients can send the minimal public call shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputShellCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub call_id: String,
+    pub action: ShellCallAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<ShellCallEnvironment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ShellCallStatus>,
+}
+
+impl From<InputShellCall> for InputFunctionToolCall {
+    fn from(call: InputShellCall) -> Self {
+        Self {
+            id: call.id,
+            call_id: call.call_id,
+            name: "shell".to_owned(),
+            namespace: None,
+            arguments: serde_json::to_string(&call.action).expect("shell call action serializes"),
+            status: call.status.map(|status| match status {
+                ShellCallStatus::InProgress | ShellCallStatus::Completed => MessageStatus::Completed,
+                ShellCallStatus::Incomplete => MessageStatus::InProgress,
+            }),
+        }
+    }
+}
+
 /// An opaque compacted context checkpoint accepted as Responses input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionItem {
@@ -193,6 +242,50 @@ impl From<CustomToolCallOutputMessage> for FunctionToolResultMessage {
     }
 }
 
+impl From<ShellCallOutput> for FunctionToolResultMessage {
+    fn from(output: ShellCallOutput) -> Self {
+        Self {
+            call_id: output.call_id,
+            output: ToolCallOutput::Text(
+                serde_json::json!({
+                    "max_output_length": output.max_output_length,
+                    "output": output.output,
+                })
+                .to_string(),
+            ),
+        }
+    }
+}
+
+/// Client result for a local native shell call. `id` and `status` are output
+/// metadata and are therefore optional when the caller submits the result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellCallOutputMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_length: Option<u64>,
+    pub output: Vec<ShellCallOutputContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ShellCallStatus>,
+}
+
+impl From<ShellCallOutputMessage> for FunctionToolResultMessage {
+    fn from(output: ShellCallOutputMessage) -> Self {
+        Self {
+            call_id: output.call_id,
+            output: ToolCallOutput::Text(
+                serde_json::json!({
+                    "max_output_length": output.max_output_length,
+                    "output": output.output,
+                })
+                .to_string(),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum InputItem {
@@ -209,6 +302,10 @@ pub enum InputItem {
     CustomToolCall(CustomToolCall),
     #[serde(rename = "custom_tool_call_output")]
     CustomToolCallOutput(CustomToolCallOutputMessage),
+    #[serde(rename = "shell_call")]
+    ShellCall(InputShellCall),
+    #[serde(rename = "shell_call_output")]
+    ShellCallOutput(ShellCallOutputMessage),
     #[serde(rename = "reasoning")]
     Reasoning(ReasoningOutput),
     /// Internal history record used by gateway orchestration to remember that
@@ -238,6 +335,8 @@ impl<'de> Deserialize<'de> for InputItem {
             Some("function_call_output") => deserialize_from_value(value).map(Self::FunctionCallOutput),
             Some("custom_tool_call") => deserialize_from_value(value).map(Self::CustomToolCall),
             Some("custom_tool_call_output") => deserialize_from_value(value).map(Self::CustomToolCallOutput),
+            Some("shell_call") => deserialize_from_value(value).map(Self::ShellCall),
+            Some("shell_call_output") => deserialize_from_value(value).map(Self::ShellCallOutput),
             Some("reasoning") => deserialize_from_value(value).map(Self::Reasoning),
             Some("mcp_list_tools") => deserialize_from_value(value).map(Self::McpListTools),
             Some("compaction") => deserialize_from_value(value).map(Self::Compaction),

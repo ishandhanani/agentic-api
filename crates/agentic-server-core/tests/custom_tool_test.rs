@@ -227,7 +227,6 @@ async fn custom_tool_type_normalizes_for_the_model_but_remains_client_owned() {
         .expect("custom registry");
     let entry = registry.lookup("agentic_raw_echo").expect("custom entry");
     assert_eq!(entry.tool_type, ToolType::Custom);
-    assert!(!entry.tool_type.is_gateway_owned());
     assert!(matches!(entry.ownership, ToolOwnership::Client));
 
     let normalized = tools[0].to_function_tools();

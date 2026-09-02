@@ -89,6 +89,11 @@ fn item_has_meaningful_context(item: &InputItem) -> bool {
         InputItem::FunctionCallOutput(output) => output.output.has_content(),
         InputItem::CustomToolCall(call) => !call.name.trim().is_empty() || !call.input.trim().is_empty(),
         InputItem::CustomToolCallOutput(output) => output.output.has_content(),
+        InputItem::ShellCall(call) => call.action.commands.iter().any(|command| !command.trim().is_empty()),
+        InputItem::ShellCallOutput(output) => output
+            .output
+            .iter()
+            .any(|content| !content.stdout.trim().is_empty() || !content.stderr.trim().is_empty()),
         InputItem::Reasoning(reasoning) => {
             reasoning.content.iter().any(|content| !content.text.trim().is_empty())
                 || reasoning.summary.iter().any(value_has_content)

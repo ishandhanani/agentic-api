@@ -1,19 +1,33 @@
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use agent_rt_control::execution_service_server::{ExecutionService, ExecutionServiceServer};
+use agent_rt_control::workspace_file_service_server::{WorkspaceFileService, WorkspaceFileServiceServer};
+use agent_rt_control::workspace_service_server::{WorkspaceService, WorkspaceServiceServer};
+use agent_rt_control::{
+    CancelExecutionRequest, Capability, CreateWorkspaceRequest, DeleteWorkspaceRequest, Execution, ExecutionResult,
+    ExecutionState, FileChunk, FileMetadata, GetExecutionRequest, GetWorkspaceRequest, ListFilesRequest,
+    ListFilesResponse, ReadFileRequest, RemoveFileRequest, RemoveFileResponse, StartExecutionRequest, StatFileRequest,
+    WatchExecutionRequest, Workspace, WorkspaceState, WriteFileRequest,
+};
 use agentic_core::config::{
     AgentRtExecutorConfig, Config, PostgresConfig, SqliteConfig, SubjectSigningKey, ToolRuntimeConfig,
 };
 use agentic_core::executor::{ExecuteRequest, ExecutionContext};
-use agentic_core::types::io::{CodeInterpreterOutput, OutputItem};
+use agentic_core::types::io::{OutputItem, ShellCallEnvironment, ShellCallOutcome, ShellCallStatus};
+use agentic_core::{AuthenticatedSubject, CreateContainerRequest, ListContainerFilesRequest, ListContainersRequest};
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::routing::post;
 use either::Either;
-use futures::StreamExt;
+use futures::{Stream, TryStreamExt};
 use tokio::sync::Mutex;
+use tonic::{Request, Response, Status};
+
+type WorkspaceFiles = Arc<Mutex<HashMap<(String, String), Vec<u8>>>>;
 
 #[derive(Clone, Default)]
 struct InferenceState {
@@ -29,11 +43,11 @@ async fn inference(
     state.requests.lock().await.push(request);
     let output = if call == 0 {
         serde_json::json!([{
-            "id": "fc_code_1",
+            "id": "fc_shell_1",
             "type": "function_call",
-            "call_id": "call_code_1",
-            "name": "code_interpreter",
-            "arguments": "{\"code\":\"print(40 + 2)\"}",
+            "call_id": "call_shell_1",
+            "name": "shell",
+            "arguments": "{\"commands\":[\"printf first\",\"printf second\"],\"max_output_length\":1024}",
             "status": "completed"
         }])
     } else {
@@ -61,289 +75,251 @@ async fn inference(
     }))
 }
 
-async fn inference_stream(
-    State(state): State<InferenceState>,
-    axum::Json(request): axum::Json<serde_json::Value>,
-) -> impl axum::response::IntoResponse {
-    let call = state.calls.fetch_add(1, Ordering::SeqCst);
-    state.requests.lock().await.push(request);
-    let events = if call == 0 {
-        vec![
-            serde_json::json!({
-                "type": "response.created",
-                "response": {"id": "upstream_stream_tool", "status": "in_progress", "usage": null}
-            }),
-            serde_json::json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {
-                    "id": "fc_code_stream",
-                    "type": "function_call",
-                    "call_id": "call_code_stream",
-                    "name": "code_interpreter",
-                    "arguments": "",
-                    "status": "in_progress"
-                }
-            }),
-            serde_json::json!({
-                "type": "response.function_call_arguments.done",
-                "item_id": "fc_code_stream",
-                "output_index": 0,
-                "call_id": "call_code_stream",
-                "name": "code_interpreter",
-                "arguments": "{\"code\":\"print(40 + 2)\"}"
-            }),
-            serde_json::json!({
-                "type": "response.completed",
-                "response": {"id": "upstream_stream_tool", "status": "completed", "usage": null}
-            }),
-        ]
-    } else {
-        vec![
-            serde_json::json!({
-                "type": "response.created",
-                "response": {"id": "upstream_stream_final", "status": "in_progress", "usage": null}
-            }),
-            serde_json::json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {
-                    "id": "msg_stream_final",
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "in_progress",
-                    "content": []
-                }
-            }),
-            serde_json::json!({
-                "type": "response.output_text.delta",
-                "item_id": "msg_stream_final",
-                "output_index": 0,
-                "content_index": 0,
-                "delta": "The result is 42."
-            }),
-            serde_json::json!({
-                "type": "response.completed",
-                "response": {"id": "upstream_stream_final", "status": "completed", "usage": null}
-            }),
-        ]
-    };
-    let mut body = String::new();
-    for event in events {
-        body.push_str("data: ");
-        body.push_str(&serde_json::to_string(&event).expect("serialize SSE event"));
-        body.push_str("\n\n");
-    }
-    body.push_str("data: [DONE]\n\n");
-    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
-}
-
 #[derive(Clone, Default)]
 struct AgentRtState {
-    calls: Arc<AtomicUsize>,
-    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    workspace_requests: Arc<Mutex<Vec<CreateWorkspaceRequest>>>,
+    execution_requests: Arc<Mutex<Vec<StartExecutionRequest>>>,
+    file_write_requests: Arc<Mutex<Vec<WriteFileRequest>>>,
+    files: WorkspaceFiles,
 }
 
-#[derive(Clone, Default)]
-struct ParallelAgentRtState {
-    calls: Arc<AtomicUsize>,
-    in_flight: Arc<AtomicUsize>,
-    max_in_flight: Arc<AtomicUsize>,
+fn assert_subject<T>(request: &Request<T>) {
+    let authorization = request
+        .metadata()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .expect("authorization metadata");
+    assert!(authorization.starts_with("Bearer "));
+    assert_eq!(authorization.matches('.').count(), 1);
 }
 
-#[derive(Clone, Default)]
-struct DisconnectAgentRtState {
-    request: Arc<Mutex<Option<serde_json::Value>>>,
-    start_seen: Arc<tokio::sync::Notify>,
-    cancel_count: Arc<AtomicUsize>,
-    cancelled: Arc<AtomicBool>,
-}
-
-async fn agent_rt(
-    State(state): State<AgentRtState>,
-    headers: HeaderMap,
-    axum::Json(request): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
-    assert!(
-        headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("Bearer v1."))
-    );
-    state.calls.fetch_add(1, Ordering::SeqCst);
-    state.requests.lock().await.push(request.clone());
-    axum::Json(serde_json::json!({
-        "api_version": "v1",
-        "execution_id": request["execution_id"],
-        "workspace_id": request["workspace_id"],
-        "route_id": request["route_id"],
-        "route_version": "blake3:route-v1",
-        "request_fingerprint": "blake3:request-v1",
-        "revision": 2,
-        "state": "completed",
-        "result": {
-            "schema_version": "sandbox-command-result-v1",
-            "output": {"exit_code": 0, "stdout": "42\n", "stderr": ""},
-            "is_error": false
-        },
-        "failure": null,
-        "artifacts": [],
-        "accepted_at": "2026-09-01T00:00:00Z",
-        "completed_at": "2026-09-01T00:00:01Z"
-    }))
-}
-
-async fn parallel_inference(
-    State(state): State<InferenceState>,
-    axum::Json(request): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
-    let call = state.calls.fetch_add(1, Ordering::SeqCst);
-    state.requests.lock().await.push(request);
-    let output = if call == 0 {
-        serde_json::json!([
-            {
-                "id": "fc_slow",
-                "type": "function_call",
-                "call_id": "call_slow",
-                "name": "code_interpreter",
-                "arguments": "{\"code\":\"print('slow-first')\"}",
-                "status": "completed"
-            },
-            {
-                "id": "fc_fast",
-                "type": "function_call",
-                "call_id": "call_fast",
-                "name": "code_interpreter",
-                "arguments": "{\"code\":\"print('fast-second')\"}",
-                "status": "completed"
-            }
-        ])
-    } else {
-        serde_json::json!([{
-            "id": "msg_parallel_final",
-            "type": "message",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": "Both finished.", "annotations": []}]
-        }])
-    };
-    axum::Json(serde_json::json!({
-        "id": format!("upstream_parallel_{call}"),
-        "object": "response",
-        "created_at": 0,
-        "model": "test-model",
-        "status": "completed",
-        "output": output,
-        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-        "incomplete_details": null,
-        "error": null,
-        "previous_response_id": null,
-        "conversation_id": null,
-        "instructions": null
-    }))
-}
-
-async fn parallel_agent_rt(
-    State(state): State<ParallelAgentRtState>,
-    axum::Json(request): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
-    state.calls.fetch_add(1, Ordering::SeqCst);
-    let in_flight = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-    state.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
-    let code = request["input"]["argv"][2].as_str().expect("Python source in argv");
-    let (delay, stdout) = if code.contains("slow-first") {
-        (Duration::from_millis(80), "slow-first\n")
-    } else {
-        (Duration::from_millis(10), "fast-second\n")
-    };
-    tokio::time::sleep(delay).await;
-    state.in_flight.fetch_sub(1, Ordering::SeqCst);
-    axum::Json(serde_json::json!({
-        "api_version": "v1",
-        "execution_id": request["execution_id"],
-        "workspace_id": request["workspace_id"],
-        "route_id": request["route_id"],
-        "route_version": "blake3:route-v1",
-        "request_fingerprint": "blake3:request-v1",
-        "revision": 2,
-        "state": "completed",
-        "result": {
-            "schema_version": "sandbox-command-result-v1",
-            "output": {"exit_code": 0, "stdout": stdout, "stderr": ""},
-            "is_error": false
-        },
-        "failure": null,
-        "artifacts": [],
-        "accepted_at": "2026-09-01T00:00:00Z",
-        "completed_at": "2026-09-01T00:00:01Z"
-    }))
-}
-
-fn disconnect_record(request: &serde_json::Value, state: &str, revision: u64) -> serde_json::Value {
-    serde_json::json!({
-        "api_version": "v1",
-        "execution_id": request["execution_id"],
-        "workspace_id": request["workspace_id"],
-        "route_id": request["route_id"],
-        "route_version": "blake3:route-v1",
-        "request_fingerprint": "blake3:request-v1",
-        "revision": revision,
-        "state": state,
-        "result": null,
-        "failure": null,
-        "artifacts": [],
-        "accepted_at": "2026-09-01T00:00:00Z",
-        "completed_at": null
-    })
-}
-
-async fn disconnect_start(
-    State(state): State<DisconnectAgentRtState>,
-    axum::Json(request): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
-    *state.request.lock().await = Some(request.clone());
-    state.start_seen.notify_one();
-    axum::Json(disconnect_record(&request, "accepted", 1))
-}
-
-async fn disconnect_lookup(
-    State(state): State<DisconnectAgentRtState>,
-    axum::extract::Path(execution_action): axum::extract::Path<String>,
-) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
-    let Some(request) = state.request.lock().await.clone() else {
-        return Err(axum::http::StatusCode::NOT_FOUND);
-    };
-    assert_eq!(request["execution_id"], execution_action);
-    if state.cancelled.load(Ordering::SeqCst) {
-        return Ok(axum::Json(disconnect_record(&request, "cancelled", 3)));
+#[tonic::async_trait]
+impl WorkspaceService for AgentRtState {
+    async fn create_workspace(&self, request: Request<CreateWorkspaceRequest>) -> Result<Response<Workspace>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        self.workspace_requests.lock().await.push(request.clone());
+        Ok(Response::new(Workspace {
+            workspace_id: request.workspace_id,
+            workspace_class_id: request.workspace_class_id,
+            workspace_class_revision: "python.default@sha256:test".to_owned(),
+            state: WorkspaceState::Ready as i32,
+            revision: 1,
+            created_at_unix_millis: 1,
+            last_active_at_unix_millis: 1,
+            expires_at_unix_millis: None,
+            capabilities: vec![Capability {
+                name: "command.execute".to_owned(),
+                version: 1,
+            }],
+            failure_code: None,
+        }))
     }
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    Ok(axum::Json(disconnect_record(&request, "running", 2)))
+
+    async fn get_workspace(&self, request: Request<GetWorkspaceRequest>) -> Result<Response<Workspace>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        Ok(Response::new(Workspace {
+            workspace_id: request.workspace_id,
+            workspace_class_id: "python.default".to_owned(),
+            workspace_class_revision: "python.default@sha256:test".to_owned(),
+            state: WorkspaceState::Ready as i32,
+            revision: 1,
+            created_at_unix_millis: 1,
+            last_active_at_unix_millis: 1,
+            expires_at_unix_millis: None,
+            capabilities: vec![Capability {
+                name: "command.execute".to_owned(),
+                version: 1,
+            }],
+            failure_code: None,
+        }))
+    }
+
+    async fn delete_workspace(&self, request: Request<DeleteWorkspaceRequest>) -> Result<Response<Workspace>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        Ok(Response::new(Workspace {
+            workspace_id: request.workspace_id,
+            workspace_class_id: "python.default".to_owned(),
+            workspace_class_revision: "python.default@sha256:test".to_owned(),
+            state: WorkspaceState::Deleted as i32,
+            revision: 2,
+            created_at_unix_millis: 1,
+            last_active_at_unix_millis: 2,
+            expires_at_unix_millis: None,
+            capabilities: Vec::new(),
+            failure_code: None,
+        }))
+    }
 }
 
-async fn disconnect_cancel(
-    State(state): State<DisconnectAgentRtState>,
-    axum::extract::Path(execution_action): axum::extract::Path<String>,
-) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
-    let execution_id = execution_action
-        .strip_suffix(":cancel")
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
-    let Some(request) = state.request.lock().await.clone() else {
-        return Err(axum::http::StatusCode::NOT_FOUND);
-    };
-    assert_eq!(request["execution_id"], execution_id);
-    state.cancel_count.fetch_add(1, Ordering::SeqCst);
-    state.cancelled.store(true, Ordering::SeqCst);
-    Ok(axum::Json(disconnect_record(&request, "cancelled", 3)))
+#[tonic::async_trait]
+impl WorkspaceFileService for AgentRtState {
+    async fn stat_file(&self, request: Request<StatFileRequest>) -> Result<Response<FileMetadata>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        let files = self.files.lock().await;
+        let content = files
+            .get(&(request.workspace_id, request.path.clone()))
+            .ok_or_else(|| Status::not_found("file_not_found"))?;
+        Ok(Response::new(file_metadata(request.path, content.len())))
+    }
+
+    async fn list_files(&self, _request: Request<ListFilesRequest>) -> Result<Response<ListFilesResponse>, Status> {
+        Err(Status::unimplemented(
+            "public listing uses the durable container catalog",
+        ))
+    }
+
+    async fn read_file(&self, request: Request<ReadFileRequest>) -> Result<Response<FileChunk>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        let files = self.files.lock().await;
+        let content = files
+            .get(&(request.workspace_id, request.path))
+            .ok_or_else(|| Status::not_found("file_not_found"))?;
+        let start = usize::try_from(request.offset).map_err(|_| Status::invalid_argument("invalid_offset"))?;
+        let max_bytes =
+            usize::try_from(request.max_bytes).map_err(|_| Status::invalid_argument("invalid_max_bytes"))?;
+        if start > content.len() {
+            return Err(Status::invalid_argument("invalid_offset"));
+        }
+        let end = start.saturating_add(max_bytes).min(content.len());
+        Ok(Response::new(FileChunk {
+            data: content[start..end].to_vec(),
+            next_offset: u64::try_from(end).expect("test file offset fits u64"),
+            eof: end == content.len(),
+        }))
+    }
+
+    async fn write_file(&self, request: Request<WriteFileRequest>) -> Result<Response<FileMetadata>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        self.file_write_requests.lock().await.push(request.clone());
+        let key = (request.workspace_id, request.path.clone());
+        let mut files = self.files.lock().await;
+        let content = files.entry(key).or_default();
+        if request.truncate {
+            content.clear();
+        }
+        let start = usize::try_from(request.offset).map_err(|_| Status::invalid_argument("invalid_offset"))?;
+        if start > content.len() {
+            return Err(Status::invalid_argument("invalid_offset"));
+        }
+        let end = start
+            .checked_add(request.data.len())
+            .ok_or_else(|| Status::invalid_argument("file_too_large"))?;
+        content.resize(end, 0);
+        content[start..end].copy_from_slice(&request.data);
+        Ok(Response::new(file_metadata(request.path, content.len())))
+    }
+
+    async fn remove_file(&self, request: Request<RemoveFileRequest>) -> Result<Response<RemoveFileResponse>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        let removed = self.files.lock().await.remove(&(request.workspace_id, request.path));
+        if removed.is_none() {
+            return Err(Status::not_found("file_not_found"));
+        }
+        Ok(Response::new(RemoveFileResponse {}))
+    }
 }
 
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+fn file_metadata(path: String, size: usize) -> FileMetadata {
+    FileMetadata {
+        path,
+        size_bytes: u64::try_from(size).expect("test file size fits u64"),
+        is_directory: false,
+        modified_at_unix_millis: Some(2),
+    }
+}
+
+#[tonic::async_trait]
+impl ExecutionService for AgentRtState {
+    type WatchExecutionStream = Pin<Box<dyn Stream<Item = Result<Execution, Status>> + Send + 'static>>;
+
+    async fn start_execution(&self, request: Request<StartExecutionRequest>) -> Result<Response<Execution>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        self.execution_requests.lock().await.push(request.clone());
+        let stdout = request
+            .command
+            .as_ref()
+            .and_then(|command| command.argv.last())
+            .map_or_else(Vec::new, |command| {
+                if command == "printf first" {
+                    b"first".to_vec()
+                } else if command == "printf second" {
+                    b"second".to_vec()
+                } else {
+                    b"unexpected command".to_vec()
+                }
+            });
+        Ok(Response::new(Execution {
+            execution_id: request.execution_id,
+            workspace_id: request.workspace_id,
+            route_id: request.route_id,
+            revision: 2,
+            state: ExecutionState::Succeeded as i32,
+            result: Some(ExecutionResult {
+                exit_code: Some(0),
+                stdout,
+                stderr: Vec::new(),
+                output_truncated: false,
+            }),
+            failure_code: None,
+            artifacts: Vec::new(),
+            accepted_at_unix_millis: 1,
+            completed_at_unix_millis: Some(2),
+        }))
+    }
+
+    async fn get_execution(&self, _request: Request<GetExecutionRequest>) -> Result<Response<Execution>, Status> {
+        Err(Status::unimplemented("not needed by this integration test"))
+    }
+
+    async fn cancel_execution(&self, _request: Request<CancelExecutionRequest>) -> Result<Response<Execution>, Status> {
+        Err(Status::unimplemented("not needed by this integration test"))
+    }
+
+    async fn watch_execution(
+        &self,
+        _request: Request<WatchExecutionRequest>,
+    ) -> Result<Response<Self::WatchExecutionStream>, Status> {
+        Err(Status::unimplemented("not needed by this integration test"))
+    }
+}
+
+async fn serve_http(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind test server");
-    let address = listener.local_addr().expect("test server address");
+        .expect("bind HTTP test server");
+    let address = listener.local_addr().expect("HTTP test server address");
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
+    });
+    (format!("http://{address}"), server)
+}
+
+async fn serve_agent_rt(state: AgentRtState) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gRPC test server");
+    let address = listener.local_addr().expect("gRPC test server address");
+    let incoming = async_stream::stream! {
+        loop {
+            yield listener.accept().await.map(|(socket, _)| socket);
+        }
+    };
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(WorkspaceServiceServer::new(state.clone()))
+            .add_service(ExecutionServiceServer::new(state.clone()))
+            .add_service(WorkspaceFileServiceServer::new(state))
+            .serve_with_incoming(incoming)
+            .await
+            .ok();
     });
     (format!("http://{address}"), server)
 }
@@ -361,6 +337,7 @@ fn test_config(inference_url: String, agent_rt_url: String) -> Config {
         tools: ToolRuntimeConfig {
             agent_rt: Some(AgentRtExecutorConfig {
                 endpoint: agent_rt_url,
+                workspace_class_id: "python.default".to_owned(),
                 route_id: "sandbox.python.default".to_owned(),
                 subject_signing_key: SubjectSigningKey::new("0123456789abcdef0123456789abcdef".to_owned()),
                 subject_issuer: "agentic-api".to_owned(),
@@ -377,39 +354,31 @@ fn test_config(inference_url: String, agent_rt_url: String) -> Config {
     }
 }
 
-fn chunk_events(chunk: &str) -> impl Iterator<Item = serde_json::Value> + '_ {
-    chunk
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .filter_map(|data| serde_json::from_str(data).ok())
-}
-
 #[tokio::test]
-async fn code_interpreter_round_uses_agent_rt_and_reinjects_only_into_dynamo_inference() {
+async fn shell_reuses_referenced_agent_rt_workspace_and_projects_native_outputs() {
     let inference_state = InferenceState::default();
-    let (inference_url, inference_server) = serve(
+    let (inference_url, inference_server) = serve_http(
         axum::Router::new()
             .route("/v1/responses", post(inference))
             .with_state(inference_state.clone()),
     )
     .await;
     let agent_rt_state = AgentRtState::default();
-    let (agent_rt_url, agent_rt_server) = serve(
-        axum::Router::new()
-            .route("/internal/v1/executions", post(agent_rt))
-            .with_state(agent_rt_state.clone()),
-    )
-    .await;
-
-    let config = test_config(inference_url, agent_rt_url);
-    let exec_ctx = Arc::new(ExecutionContext::from_config(&config).await.expect("execution context"));
+    let (agent_rt_url, agent_rt_server) = serve_agent_rt(agent_rt_state.clone()).await;
+    let exec_ctx = Arc::new(
+        ExecutionContext::from_config(&test_config(inference_url, agent_rt_url))
+            .await
+            .expect("execution context"),
+    );
     let payload = serde_json::from_value(serde_json::json!({
         "model": "test-model",
-        "input": "Calculate 40 + 2 with Python.",
+        "input": "Run two shell commands.",
         "store": false,
         "stream": false,
-        "tools": [{"type": "code_interpreter"}]
+        "tools": [{"type": "shell", "environment": {
+            "type": "container_reference",
+            "container_id": "cntr_existing"
+        }}]
     }))
     .expect("request payload");
 
@@ -422,30 +391,67 @@ async fn code_interpreter_round_uses_agent_rt_and_reinjects_only_into_dynamo_inf
     };
 
     assert_eq!(inference_state.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(agent_rt_state.calls.load(Ordering::SeqCst), 1);
-    assert!(
-        response
-            .output
-            .iter()
-            .any(|item| matches!(item, OutputItem::CodeInterpreterCall(call) if call.container_id.starts_with("ws_")))
-    );
+    let [
+        OutputItem::ShellCall(call),
+        OutputItem::ShellCallOutput(output),
+        OutputItem::Message(_),
+    ] = response.output.as_slice()
+    else {
+        panic!("expected native shell call, shell output, then assistant message");
+    };
+    assert_eq!(call.call_id, "call_shell_1");
+    assert_eq!(call.action.commands, ["printf first", "printf second"]);
+    assert_eq!(call.status, ShellCallStatus::Completed);
+    let Some(ShellCallEnvironment::ContainerReference { container_id }) = &call.environment else {
+        panic!("shell must project the referenced agent-rt workspace");
+    };
+    assert_eq!(container_id, "cntr_existing");
+    assert_eq!(output.call_id, "call_shell_1");
+    assert_eq!(output.status, ShellCallStatus::Completed);
+    assert_eq!(output.output.len(), 2);
+    assert_eq!(output.output[0].stdout, "first");
+    assert_eq!(output.output[1].stdout, "second");
+    assert!(matches!(
+        output.output[0].outcome,
+        ShellCallOutcome::Exit { exit_code: 0 }
+    ));
+    assert!(matches!(
+        output.output[1].outcome,
+        ShellCallOutcome::Exit { exit_code: 0 }
+    ));
     let inference_requests = inference_state.requests.lock().await;
     assert_eq!(inference_requests.len(), 2);
-    assert!(inference_requests[0]["tools"].as_array().is_some_and(|tools| {
-        tools
-            .iter()
-            .any(|tool| tool["function"]["name"] == "code_interpreter" || tool["name"] == "code_interpreter")
-    }));
-    let reinjected = inference_requests[1]["input"].to_string();
-    assert!(reinjected.contains("call_code_1"));
+    let reinjected = inference_requests[1].to_string();
+    assert!(reinjected.contains("call_shell_1"));
     assert!(reinjected.contains("function_call_output"));
-    assert!(!inference_requests[1].to_string().contains("previous_response_id"));
+    assert!(reinjected.contains("first"));
+    assert!(reinjected.contains("second"));
+    assert!(!reinjected.contains("shell_call_output"));
+    assert!(!reinjected.contains("previous_response_id"));
 
-    let execution_requests = agent_rt_state.requests.lock().await;
-    assert_eq!(execution_requests.len(), 1);
-    assert_eq!(execution_requests[0]["route_id"], "sandbox.python.default");
-    assert!(execution_requests[0].get("provider").is_none());
-    assert!(execution_requests[0].get("credentials").is_none());
+    let workspace_requests = agent_rt_state.workspace_requests.lock().await;
+    assert!(workspace_requests.is_empty());
+    let execution_requests = agent_rt_state.execution_requests.lock().await;
+    assert_eq!(execution_requests.len(), 2);
+    assert!(
+        execution_requests
+            .iter()
+            .all(|request| request.route_id == "sandbox.python.default")
+    );
+    assert_eq!(execution_requests[0].workspace_id, execution_requests[1].workspace_id);
+    assert_eq!(execution_requests[0].workspace_id, "cntr_existing");
+    assert_ne!(execution_requests[0].execution_id, execution_requests[1].execution_id);
+    assert_eq!(
+        execution_requests[0].command.as_ref().expect("command").argv,
+        ["sh", "-lc", "printf first"]
+    );
+    assert_eq!(
+        execution_requests[1].command.as_ref().expect("command").argv,
+        ["sh", "-lc", "printf second"]
+    );
+    assert_eq!(execution_requests[0].client_metadata["call_id"], "call_shell_1");
+    assert_eq!(execution_requests[0].client_metadata["command_index"], "0");
+    assert_eq!(execution_requests[1].client_metadata["command_index"], "1");
 
     let ledger_state: String = sqlx::query_scalar("SELECT state FROM remote_executions")
         .fetch_one(exec_ctx.storage_pool().expect("configured ledger"))
@@ -458,299 +464,183 @@ async fn code_interpreter_round_uses_agent_rt_and_reinjects_only_into_dynamo_inf
 }
 
 #[tokio::test]
-async fn previous_response_continuation_hydrates_remote_tool_history_for_dynamo() {
+async fn local_shell_round_trips_through_the_client_without_agent_rt_dispatch() {
     let inference_state = InferenceState::default();
-    let (inference_url, inference_server) = serve(
+    let (inference_url, inference_server) = serve_http(
         axum::Router::new()
             .route("/v1/responses", post(inference))
             .with_state(inference_state.clone()),
     )
     .await;
-    let agent_rt_state = AgentRtState::default();
-    let (agent_rt_url, agent_rt_server) = serve(
-        axum::Router::new()
-            .route("/internal/v1/executions", post(agent_rt))
-            .with_state(agent_rt_state.clone()),
-    )
-    .await;
-    let exec_ctx = Arc::new(
-        ExecutionContext::from_config(&test_config(inference_url, agent_rt_url))
-            .await
-            .expect("execution context"),
-    );
-    let first_payload = serde_json::from_value(serde_json::json!({
+    let mut config = test_config(inference_url, "http://127.0.0.1:1".to_owned());
+    config.tools.agent_rt = None;
+    let exec_ctx = Arc::new(ExecutionContext::from_config(&config).await.expect("execution context"));
+    let first_request = serde_json::from_value(serde_json::json!({
         "model": "test-model",
-        "input": "Calculate 40 + 2 with Python.",
+        "input": "Run two shell commands locally.",
         "store": true,
         "stream": false,
-        "tools": [{"type": "code_interpreter"}]
+        "tools": [{"type": "shell", "environment": {"type": "local"}}]
     }))
-    .expect("first request payload");
-    let Either::Left(first) = ExecuteRequest::new(first_payload, Arc::clone(&exec_ctx))
+    .expect("local shell request");
+
+    let Either::Left(first_response) = ExecuteRequest::new(first_request, Arc::clone(&exec_ctx))
         .run()
         .await
-        .expect("stored remote tool turn")
+        .expect("client-owned shell round")
     else {
         panic!("expected blocking response");
     };
-    let second_payload = serde_json::from_value(serde_json::json!({
-        "model": "test-model",
-        "input": "Confirm the prior result.",
-        "previous_response_id": first.id,
-        "store": true,
-        "stream": false,
-        "tools": [{"type": "code_interpreter"}]
-    }))
-    .expect("continuation payload");
-    let Either::Left(_) = ExecuteRequest::new(second_payload, Arc::clone(&exec_ctx))
-        .run()
-        .await
-        .expect("hydrated continuation")
-    else {
-        panic!("expected blocking continuation");
+    let [OutputItem::ShellCall(call)] = first_response.output.as_slice() else {
+        panic!("expected one client-owned native shell call");
     };
+    assert_eq!(call.call_id, "call_shell_1");
+    assert!(matches!(call.environment, Some(ShellCallEnvironment::Local)));
+    assert_eq!(call.status, ShellCallStatus::InProgress);
 
-    assert_eq!(agent_rt_state.calls.load(Ordering::SeqCst), 1);
-    let requests = inference_state.requests.lock().await;
-    assert_eq!(requests.len(), 3);
-    let continuation = requests[2].to_string();
-    for expected in [
-        "Calculate 40 + 2 with Python.",
-        "call_code_1",
-        "function_call_output",
-        "42",
-        "The result is 42.",
-        "Confirm the prior result.",
-    ] {
-        assert!(
-            continuation.contains(expected),
-            "hydrated continuation omitted {expected}: {continuation}"
-        );
-    }
-    assert!(!continuation.contains("previous_response_id"));
-    inference_server.abort();
-    agent_rt_server.abort();
-}
-
-#[tokio::test]
-async fn parallel_agent_rt_calls_overlap_and_retain_model_call_order() {
-    let inference_state = InferenceState::default();
-    let (inference_url, inference_server) = serve(
-        axum::Router::new()
-            .route("/v1/responses", post(parallel_inference))
-            .with_state(inference_state.clone()),
-    )
-    .await;
-    let agent_rt_state = ParallelAgentRtState::default();
-    let (agent_rt_url, agent_rt_server) = serve(
-        axum::Router::new()
-            .route("/internal/v1/executions", post(parallel_agent_rt))
-            .with_state(agent_rt_state.clone()),
-    )
-    .await;
-    let exec_ctx = Arc::new(
-        ExecutionContext::from_config(&test_config(inference_url, agent_rt_url))
-            .await
-            .expect("execution context"),
-    );
-    let payload = serde_json::from_value(serde_json::json!({
+    let previous_response_id = first_response.id.clone();
+    let second_request = serde_json::from_value(serde_json::json!({
         "model": "test-model",
-        "input": "Run both snippets.",
-        "store": false,
-        "stream": false,
-        "parallel_tool_calls": true,
-        "tools": [{"type": "code_interpreter"}]
-    }))
-    .expect("request payload");
-
-    let Either::Left(response) = ExecuteRequest::new(payload, Arc::clone(&exec_ctx))
-        .run()
-        .await
-        .expect("parallel agentic tool round")
-    else {
-        panic!("expected blocking response");
-    };
-
-    assert_eq!(agent_rt_state.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(agent_rt_state.max_in_flight.load(Ordering::SeqCst), 2);
-    let calls = response
-        .output
-        .iter()
-        .filter_map(|item| match item {
-            OutputItem::CodeInterpreterCall(call) => Some((call.id.as_str(), call.code.as_str(), &call.outputs)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].0, "fc_slow");
-    assert_eq!(calls[0].1, "print('slow-first')");
-    assert!(matches!(calls[0].2.as_slice(), [CodeInterpreterOutput::Logs { logs }] if logs == "slow-first\n"));
-    assert_eq!(calls[1].0, "fc_fast");
-    assert_eq!(calls[1].1, "print('fast-second')");
-    assert!(matches!(calls[1].2.as_slice(), [CodeInterpreterOutput::Logs { logs }] if logs == "fast-second\n"));
-
-    let ledger_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM remote_executions")
-        .fetch_one(exec_ctx.storage_pool().expect("configured ledger"))
-        .await
-        .expect("ledger rows");
-    assert_eq!(ledger_rows, 2);
-    inference_server.abort();
-    agent_rt_server.abort();
-}
-
-#[tokio::test]
-async fn streaming_code_interpreter_persists_remote_outcome_before_public_completion() {
-    let inference_state = InferenceState::default();
-    let (inference_url, inference_server) = serve(
-        axum::Router::new()
-            .route("/v1/responses", post(inference_stream))
-            .with_state(inference_state.clone()),
-    )
-    .await;
-    let agent_rt_state = AgentRtState::default();
-    let (agent_rt_url, agent_rt_server) = serve(
-        axum::Router::new()
-            .route("/internal/v1/executions", post(agent_rt))
-            .with_state(agent_rt_state.clone()),
-    )
-    .await;
-    let exec_ctx = Arc::new(
-        ExecutionContext::from_config(&test_config(inference_url, agent_rt_url))
-            .await
-            .expect("execution context"),
-    );
-    let payload = serde_json::from_value(serde_json::json!({
-        "model": "test-model",
-        "input": "Calculate 40 + 2 with Python.",
-        "store": false,
-        "stream": true,
-        "tools": [{"type": "code_interpreter"}]
-    }))
-    .expect("request payload");
-
-    let Either::Right(stream) = ExecuteRequest::new(payload, Arc::clone(&exec_ctx))
-        .run()
-        .await
-        .expect("streaming agentic tool round")
-    else {
-        panic!("expected streaming response");
-    };
-    let mut stream = Box::pin(stream);
-    let mut event_types = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        for event in chunk_events(&chunk) {
-            let Some(event_type) = event["type"].as_str() else {
-                continue;
-            };
-            if event_type == "response.code_interpreter_call.completed" {
-                let ledger_state: String = sqlx::query_scalar("SELECT state FROM remote_executions")
-                    .fetch_one(exec_ctx.storage_pool().expect("configured ledger"))
-                    .await
-                    .expect("ledger row must exist before public completion");
-                assert_eq!(ledger_state, "completed");
+        "previous_response_id": previous_response_id,
+        "input": [
+            {
+                "type": "shell_call_output",
+                "call_id": call.call_id,
+                "max_output_length": call.action.max_output_length,
+                "output": [
+                    {"stdout": "first", "stderr": "", "outcome": {"type": "exit", "exit_code": 0}},
+                    {"stdout": "second", "stderr": "", "outcome": {"type": "exit", "exit_code": 0}}
+                ]
             }
-            event_types.push(event_type.to_owned());
-        }
-    }
+        ],
+        "store": true,
+        "stream": false
+    }))
+    .expect("local shell continuation");
 
-    let tool_completed = event_types
-        .iter()
-        .position(|event| event == "response.code_interpreter_call.completed")
-        .unwrap_or_else(|| panic!("native code interpreter completion event missing: {event_types:?}"));
-    let response_completed = event_types
-        .iter()
-        .rposition(|event| event == "response.completed")
-        .expect("terminal response event");
-    assert!(tool_completed < response_completed);
-    assert_eq!(inference_state.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(agent_rt_state.calls.load(Ordering::SeqCst), 1);
+    let Either::Left(second_response) = ExecuteRequest::new(second_request, Arc::clone(&exec_ctx))
+        .run()
+        .await
+        .expect("local shell continuation round")
+    else {
+        panic!("expected blocking response");
+    };
+    assert!(matches!(second_response.output.as_slice(), [OutputItem::Message(_)]));
+
     let inference_requests = inference_state.requests.lock().await;
-    assert!(inference_requests.iter().all(|request| request["stream"] == true));
-    assert!(!inference_requests[1].to_string().contains("previous_response_id"));
-
+    assert_eq!(inference_requests.len(), 2);
+    let continuation = inference_requests[1].to_string();
+    assert!(continuation.contains("function_call"));
+    assert!(continuation.contains("function_call_output"));
+    assert!(continuation.contains("call_shell_1"));
+    assert!(continuation.contains("first"));
+    assert!(!continuation.contains("shell_call_output"));
     inference_server.abort();
-    agent_rt_server.abort();
 }
 
 #[tokio::test]
-async fn dropping_public_stream_cancels_remote_execution_and_keeps_it_queryable() {
-    let inference_state = InferenceState::default();
-    let (inference_url, inference_server) = serve(
-        axum::Router::new()
-            .route("/v1/responses", post(inference_stream))
-            .with_state(inference_state),
-    )
-    .await;
-    let agent_rt_state = DisconnectAgentRtState::default();
-    let (agent_rt_url, agent_rt_server) = serve(
-        axum::Router::new()
-            .route("/internal/v1/executions", post(disconnect_start))
-            .route(
-                "/internal/v1/executions/{execution_id}",
-                axum::routing::get(disconnect_lookup).post(disconnect_cancel),
-            )
-            .with_state(agent_rt_state.clone()),
-    )
-    .await;
-    let exec_ctx = Arc::new(
-        ExecutionContext::from_config(&test_config(inference_url, agent_rt_url.clone()))
-            .await
-            .expect("execution context"),
-    );
-    let payload = serde_json::from_value(serde_json::json!({
-        "model": "test-model",
-        "input": "Run until disconnected.",
-        "store": false,
-        "stream": true,
-        "tools": [{"type": "code_interpreter"}]
-    }))
-    .expect("request payload");
-    let Either::Right(mut stream) = ExecuteRequest::new(payload, Arc::clone(&exec_ctx))
-        .run()
+async fn containers_catalog_maps_lifecycle_and_files_to_agent_rt() {
+    let agent_rt_state = AgentRtState::default();
+    let (agent_rt_url, agent_rt_server) = serve_agent_rt(agent_rt_state.clone()).await;
+    let exec_ctx = ExecutionContext::from_config(&test_config("http://127.0.0.1:1".to_owned(), agent_rt_url))
         .await
-        .expect("streaming agentic tool round")
-    else {
-        panic!("expected streaming response");
+        .expect("execution context");
+    let service = exec_ctx.container_service().expect("container service");
+    let subject = AuthenticatedSubject {
+        tenant_id: "tenant-a".to_owned(),
+        principal_id: "principal-a".to_owned(),
     };
-    let consumer = tokio::spawn(async move { while stream.next().await.is_some() {} });
-    tokio::time::timeout(Duration::from_secs(2), agent_rt_state.start_seen.notified())
-        .await
-        .expect("remote execution was not accepted");
-    consumer.abort();
-    let _ = consumer.await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while agent_rt_state.cancel_count.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("disconnect did not send best-effort cancellation");
-    assert_eq!(agent_rt_state.cancel_count.load(Ordering::SeqCst), 1);
+    let traceparent = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    let create: CreateContainerRequest =
+        serde_json::from_value(serde_json::json!({"name": "test-container"})).expect("create container request");
 
-    let request = agent_rt_state
-        .request
-        .lock()
+    let container = service
+        .create(&subject, create, traceparent)
         .await
-        .clone()
-        .expect("accepted execution request");
-    let retained = reqwest::Client::new()
-        .get(format!(
-            "{agent_rt_url}/internal/v1/executions/{}",
-            request["execution_id"].as_str().expect("execution ID")
-        ))
-        .send()
+        .expect("create container");
+    assert!(container.id.starts_with("cntr_"));
+    assert_eq!(container.name, "test-container");
+    assert_eq!(container.status, "running");
+
+    let mut expected = vec![b'a'; 1024 * 1024];
+    expected.extend_from_slice(b"tail");
+    let file = service
+        .create_file(
+            &subject,
+            &container.id,
+            "../results?.txt",
+            bytes::Bytes::from(expected.clone()),
+            traceparent,
+        )
         .await
-        .expect("lookup retained execution");
-    assert_eq!(retained.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        retained.json::<serde_json::Value>().await.unwrap()["state"],
-        "cancelled"
-    );
-    let ledger_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM remote_executions")
-        .fetch_one(exec_ctx.storage_pool().expect("configured ledger"))
+        .expect("create container file");
+    assert!(file.id.starts_with("cfile_"));
+    assert_eq!(file.container_id, container.id);
+    assert!(file.path.ends_with("-results_.txt"));
+    assert_eq!(file.bytes, u64::try_from(expected.len()).expect("test size fits u64"));
+
+    let writes = agent_rt_state.file_write_requests.lock().await;
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].offset, 0);
+    assert!(writes[0].truncate);
+    assert_eq!(writes[1].offset, 1024 * 1024);
+    assert!(!writes[1].truncate);
+    drop(writes);
+
+    let retrieved = service
+        .retrieve_file(&subject, &container.id, &file.id, traceparent)
         .await
-        .expect("ledger row survives disconnect");
-    assert_eq!(ledger_rows, 1);
-    inference_server.abort();
+        .expect("retrieve container file");
+    assert_eq!(retrieved.bytes, file.bytes);
+    let files = service
+        .list_files(
+            &subject,
+            &container.id,
+            serde_json::from_value::<ListContainerFilesRequest>(serde_json::json!({})).expect("list files request"),
+        )
+        .await
+        .expect("list container files");
+    assert_eq!(files.data.len(), 1);
+    assert_eq!(files.first_id.as_deref(), Some(file.id.as_str()));
+    assert!(!files.has_more);
+
+    let chunks = service
+        .read_file_content(&subject, &container.id, &file.id, traceparent)
+        .await
+        .expect("container file content")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("read container file content");
+    assert_eq!(chunks.concat(), expected);
+
+    let deleted_file = service
+        .delete_file(&subject, &container.id, &file.id, traceparent)
+        .await
+        .expect("delete container file");
+    assert!(deleted_file.deleted);
+    let files = service
+        .list_files(
+            &subject,
+            &container.id,
+            serde_json::from_value::<ListContainerFilesRequest>(serde_json::json!({})).expect("list files request"),
+        )
+        .await
+        .expect("list container files after deletion");
+    assert!(files.data.is_empty());
+
+    let deleted = service
+        .delete(&subject, &container.id, traceparent)
+        .await
+        .expect("delete container");
+    assert!(deleted.deleted);
+    let containers = service
+        .list(
+            &subject,
+            serde_json::from_value::<ListContainersRequest>(serde_json::json!({})).expect("list containers request"),
+        )
+        .await
+        .expect("list containers after deletion");
+    assert!(containers.data.is_empty());
+
     agent_rt_server.abort();
 }

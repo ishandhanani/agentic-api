@@ -16,9 +16,10 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
+agent-rt-control = { path = "crates/agent-rt-control", version = "0.1.0" }
 agentic-core = { package = "agentic-server-core", path = "crates/agentic-server-core", version = "0.5.0" }
 async-stream = "0.3"
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 base64 = "0.22"
 blake3 = "1"
 either = "1"
@@ -32,6 +33,7 @@ http = "1"
 hmac = "0.12"
 jsonwebtoken = { version = "=10.3.0", default-features = false, features = ["rust_crypto"] }
 percent-encoding = "2"
+prost = "0.13.5"
 reqwest = { version = "0.12", default-features = false }
 rmcp-reqwest = { package = "reqwest", version = "0.13.2", default-features = false, features = ["json", "stream", "rustls"] }
 rmcp = { version = "1.8", default-features = false }
@@ -41,6 +43,7 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
+tonic = "0.13.1"
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
