@@ -181,12 +181,9 @@ impl ExecutionContext {
         let mut gateway_executors = GatewayExecutors::from_config(Arc::clone(&client), &cfg.tools)
             .map_err(|error| Error::Config(format!("failed to validate configured tool executors: {error}")))?;
         if let Some(agent_rt) = cfg.tools.agent_rt.clone() {
-            let executor = RemoteAgentRtExecutor::new(
-                Arc::clone(&client),
-                agent_rt,
-                crate::storage::RemoteExecutionLedger::new(pool.clone()),
-            )
-            .map_err(|error| Error::Config(format!("failed to configure agent-rt executor: {error}")))?;
+            let executor =
+                RemoteAgentRtExecutor::new(agent_rt, crate::storage::RemoteExecutionLedger::new(pool.clone()))
+                    .map_err(|error| Error::Config(format!("failed to configure agent-rt executor: {error}")))?;
             gateway_executors.register(Arc::new(executor));
         }
         Ok(Self {

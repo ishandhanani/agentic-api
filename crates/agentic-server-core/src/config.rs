@@ -115,6 +115,7 @@ impl std::fmt::Debug for SubjectSigningKey {
 #[derive(Debug, Clone)]
 pub struct AgentRtExecutorConfig {
     pub endpoint: String,
+    pub workspace_class_id: String,
     pub route_id: String,
     pub subject_signing_key: SubjectSigningKey,
     pub subject_issuer: String,

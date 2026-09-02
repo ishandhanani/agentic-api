@@ -216,7 +216,7 @@ pub(crate) fn stable_execution_identity(
 
 fn stable_id(prefix: &str, components: &[&str]) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"agentic-api-remote-execution-v1");
+    hasher.update(b"agentic-api-remote-execution");
     for component in components {
         hasher.update(&(component.len() as u64).to_le_bytes());
         hasher.update(component.as_bytes());

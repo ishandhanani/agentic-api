@@ -1,13 +1,21 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agent_rt_control::execution_service_client::ExecutionServiceClient;
+use agent_rt_control::workspace_service_client::WorkspaceServiceClient;
+use agent_rt_control::{
+    CancelExecutionRequest, Command, CreateWorkspaceRequest, Execution, ExecutionLimits, ExecutionState,
+    GetExecutionRequest, StartExecutionRequest, WatchExecutionRequest, WorkspaceState,
+};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tonic::metadata::MetadataValue;
+use tonic::transport::{Channel, Endpoint};
+use tonic::{Code, Request, Status};
 
 use super::{GatewayExecutionContext, GatewayExecutor, ToolError, ToolHandler, ToolOutput, ToolType};
 use crate::config::AgentRtExecutorConfig;
@@ -18,40 +26,38 @@ use crate::types::io::output::{
 use crate::types::io::{FunctionTool, OutputItem};
 use crate::types::tools::CodeInterpreterToolParam;
 
-const EXECUTION_API_VERSION: &str = "v1";
-const COMMAND_SCHEMA_VERSION: &str = "sandbox-command-v1";
-
 #[derive(Clone)]
 pub struct RemoteAgentRtExecutor {
-    client: Arc<reqwest::Client>,
+    channel: Channel,
     config: AgentRtExecutorConfig,
     ledger: RemoteExecutionLedger,
 }
 
 impl std::fmt::Debug for RemoteAgentRtExecutor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteAgentRtExecutor")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteAgentRtExecutor")
             .field("endpoint", &self.config.endpoint)
+            .field("workspace_class_id", &self.config.workspace_class_id)
             .field("route_id", &self.config.route_id)
             .finish_non_exhaustive()
     }
 }
 
 impl RemoteAgentRtExecutor {
-    /// Builds a remote executor from deployment-owned configuration.
+    /// Builds the generated gRPC client over deployment-owned configuration.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Config`] when the endpoint, route, or signing key
-    /// cannot satisfy the private execution contract.
-    pub fn new(
-        client: Arc<reqwest::Client>,
-        config: AgentRtExecutorConfig,
-        ledger: RemoteExecutionLedger,
-    ) -> Result<Self, ToolError> {
-        if config.endpoint.trim().is_empty() || config.route_id.trim().is_empty() {
+    /// Returns [`ToolError::Config`] when the endpoint, workspace class, route,
+    /// or signing key cannot satisfy the private execution contract.
+    pub fn new(config: AgentRtExecutorConfig, ledger: RemoteExecutionLedger) -> Result<Self, ToolError> {
+        if config.endpoint.trim().is_empty()
+            || config.workspace_class_id.trim().is_empty()
+            || config.route_id.trim().is_empty()
+        {
             return Err(ToolError::Config(
-                "agent-rt endpoint and route_id must not be empty".to_owned(),
+                "agent-rt endpoint, workspace_class_id, and route_id must not be empty".to_owned(),
             ));
         }
         if config.subject_signing_key.expose().len() < 32 {
@@ -59,20 +65,29 @@ impl RemoteAgentRtExecutor {
                 "agent-rt subject signing key must contain at least 32 bytes".to_owned(),
             ));
         }
-        Ok(Self { client, config, ledger })
+        let endpoint = Endpoint::from_shared(config.endpoint.trim_end_matches('/').to_owned())
+            .map_err(|error| ToolError::Config(format!("invalid agent-rt endpoint: {error}")))?
+            .connect_timeout(config.transport_timeout);
+        Ok(Self {
+            channel: endpoint.connect_lazy(),
+            config,
+            ledger,
+        })
     }
 
     async fn execute_remote(&self, context: GatewayExecutionContext, arguments: &str) -> Result<ToolOutput, ToolError> {
         let (link, request, token) = self.prepare_execution(&context, arguments).await?;
+        self.create_workspace(&link, &token, context.trace_context.traceparent.as_deref())
+            .await
+            .map_err(remote_error)?;
         let mut cancel_on_drop = RemoteCancelOnDrop::new(
-            Arc::clone(&self.client),
-            self.endpoint().to_owned(),
+            self.channel.clone(),
             self.config.transport_timeout,
             link.execution_id.clone(),
             token.clone(),
         );
         let record = self
-            .start_or_recover(&link, &request, &token, context.trace_context.traceparent.as_deref())
+            .start_or_recover(&link, request, &token, context.trace_context.traceparent.as_deref())
             .await?;
         let outcome = self.await_terminal(&context, &link, &token, record).await;
         cancel_on_drop.disarm();
@@ -123,44 +138,84 @@ impl RemoteAgentRtExecutor {
             ));
         }
 
+        let absolute_deadline_unix_millis = u64::try_from(link.absolute_deadline)
+            .unwrap_or_default()
+            .saturating_mul(1_000);
         let request = StartExecutionRequest {
-            api_version: EXECUTION_API_VERSION.to_owned(),
             execution_id: link.execution_id.clone(),
             workspace_id: link.workspace_id.clone(),
             route_id: link.route_id.clone(),
-            input: SandboxCommandInput {
-                schema_version: COMMAND_SCHEMA_VERSION.to_owned(),
+            command: Some(Command {
                 argv: vec!["python".to_owned(), "-c".to_owned(), args.code],
                 cwd: None,
-                env: BTreeMap::new(),
-                stdin_base64: String::new(),
+                env: HashMap::new(),
+                stdin: Vec::new(),
                 artifact_paths: Vec::new(),
-            },
-            absolute_deadline: chrono::DateTime::<chrono::Utc>::from(
-                UNIX_EPOCH + Duration::from_secs(u64::try_from(link.absolute_deadline).unwrap_or_default()),
+            }),
+            absolute_deadline_unix_millis,
+            limits: Some(ExecutionLimits::default()),
+            client_metadata: [
+                ("response_id".to_owned(), link.response_id.clone()),
+                ("call_id".to_owned(), link.call_id.clone()),
+            ]
+            .into_iter()
+            .chain(
+                link.conversation_id
+                    .clone()
+                    .map(|value| ("conversation_id".to_owned(), value)),
             )
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            limits: RequestedExecutionLimits::default(),
-            provenance: ExecutionProvenance {
-                response: link.response_id.clone(),
-                conversation: link.conversation_id.clone(),
-                call: link.call_id.clone(),
-            },
+            .collect(),
         };
         let token = self.sign_subject(&link)?;
         Ok((link, request, token))
     }
 
+    async fn create_workspace(
+        &self,
+        link: &RemoteExecutionLink,
+        token: &str,
+        traceparent: Option<&str>,
+    ) -> Result<(), RemoteTransportError> {
+        let message = CreateWorkspaceRequest {
+            workspace_id: link.workspace_id.clone(),
+            workspace_class_id: self.config.workspace_class_id.clone(),
+        };
+        let execute = || async {
+            let request = grpc_request(message.clone(), token, self.config.transport_timeout, traceparent)?;
+            WorkspaceServiceClient::new(self.channel.clone())
+                .create_workspace(request)
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(|status| classify_status(&status))
+        };
+        let workspace = match execute().await {
+            Ok(workspace) => workspace,
+            Err(RemoteTransportError::Ambiguous(_)) => execute().await?,
+            Err(error) => return Err(error),
+        };
+        match WorkspaceState::try_from(workspace.state) {
+            Ok(WorkspaceState::Ready) => Ok(()),
+            Ok(state) => Err(RemoteTransportError::Rejected {
+                code: Code::FailedPrecondition,
+                message: format!("workspace is not ready: {}", state.as_str_name()),
+            }),
+            Err(_) => Err(RemoteTransportError::Rejected {
+                code: Code::Internal,
+                message: "workspace returned an unknown lifecycle state".to_owned(),
+            }),
+        }
+    }
+
     async fn start_or_recover(
         &self,
         link: &RemoteExecutionLink,
-        request: &StartExecutionRequest,
+        request: StartExecutionRequest,
         token: &str,
         traceparent: Option<&str>,
-    ) -> Result<ExecutionApiRecord, ToolError> {
-        let record = match self.start(request, token, traceparent).await {
+    ) -> Result<ExecutionOutcome, ToolError> {
+        let record = match self.start(request.clone(), token, traceparent).await {
             Ok(record) => record,
-            Err(RemoteTransportError::Ambiguous(_)) => match self.lookup(link, token, None, Duration::ZERO).await {
+            Err(RemoteTransportError::Ambiguous(_)) => match self.lookup(link, token).await {
                 Ok(record) => record,
                 Err(RemoteTransportError::NotFound) => match self.start(request, token, traceparent).await {
                     Ok(record) => record,
@@ -180,7 +235,7 @@ impl RemoteAgentRtExecutor {
             },
             Err(error) => return Err(remote_error(error)),
         };
-        Ok(record)
+        ExecutionOutcome::try_from(record).map_err(remote_error)
     }
 
     async fn await_terminal(
@@ -188,30 +243,22 @@ impl RemoteAgentRtExecutor {
         context: &GatewayExecutionContext,
         link: &RemoteExecutionLink,
         token: &str,
-        mut record: ExecutionApiRecord,
+        mut record: ExecutionOutcome,
     ) -> Result<ToolOutput, ToolError> {
         loop {
-            if record.state.is_known_terminal() || record.state == ExecutionApiState::OutcomeUnknown {
+            if record.state.is_terminal() {
                 return self.finish(&context.call_id, link, record).await;
             }
             if context.cancellation.is_cancelled() {
-                record = match self.cancel(link, token).await {
-                    Ok(record) => record,
-                    Err(_) => {
-                        return self
-                            .finish_unknown(link, "cancellation did not return an authoritative provider outcome")
-                            .await;
-                    }
-                };
-                if record.state.is_known_terminal() {
-                    return self.finish(&context.call_id, link, record).await;
-                }
-                return self
-                    .finish_unknown(link, "caller cancelled before an authoritative provider outcome")
-                    .await;
+                record = self
+                    .cancel(link, token)
+                    .await
+                    .and_then(ExecutionOutcome::try_from)
+                    .map_err(remote_error)?;
+                return self.finish(&context.call_id, link, record).await;
             }
             if unix_seconds_i64() >= link.absolute_deadline {
-                record = match self.lookup(link, token, Some(record.revision), Duration::ZERO).await {
+                record = match self.lookup(link, token).await.and_then(ExecutionOutcome::try_from) {
                     Ok(record) => record,
                     Err(_) => {
                         return self
@@ -219,7 +266,7 @@ impl RemoteAgentRtExecutor {
                             .await;
                     }
                 };
-                if record.state.is_known_terminal() || record.state == ExecutionApiState::OutcomeUnknown {
+                if record.state.is_terminal() {
                     return self.finish(&context.call_id, link, record).await;
                 }
                 return self
@@ -231,11 +278,9 @@ impl RemoteAgentRtExecutor {
             }
 
             record = tokio::select! {
-                () = context.cancellation.cancelled() => {
-                    continue;
-                }
-                result = self.lookup(link, token, Some(record.revision), self.config.lookup_wait) => {
-                    match result {
+                () = context.cancellation.cancelled() => continue,
+                result = self.watch_once(link, token, record.revision) => {
+                    match result.and_then(ExecutionOutcome::try_from) {
                         Ok(record) => record,
                         Err(RemoteTransportError::Ambiguous(_)) => {
                             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -243,7 +288,7 @@ impl RemoteAgentRtExecutor {
                         }
                         Err(_) => {
                             return self
-                                .finish_unknown(link, "accepted execution could not be reconciled by lookup")
+                                .finish_unknown(link, "accepted execution could not be reconciled by watch")
                                 .await;
                         }
                     }
@@ -256,7 +301,7 @@ impl RemoteAgentRtExecutor {
         &self,
         call_id: &str,
         link: &RemoteExecutionLink,
-        record: ExecutionApiRecord,
+        record: ExecutionOutcome,
     ) -> Result<ToolOutput, ToolError> {
         let outcome = serde_json::to_string(&record)
             .map_err(|error| ToolError::Execution(format!("failed to serialize agent-rt outcome: {error}")))?;
@@ -264,13 +309,13 @@ impl RemoteAgentRtExecutor {
             .record_outcome(link, record.state.as_str(), &outcome)
             .await
             .map_err(|error| ToolError::Execution(format!("failed to persist remote execution outcome: {error}")))?;
-        if record.state == ExecutionApiState::OutcomeUnknown {
+        if record.state == ExecutionOutcomeState::OutcomeUnknown {
             return Err(ToolError::OutcomeUnknown {
                 execution_id: link.execution_id.clone(),
                 message: "agent-rt cannot determine the provider outcome".to_owned(),
             });
         }
-        if record.state != ExecutionApiState::Completed {
+        if record.state != ExecutionOutcomeState::Completed {
             return Err(ToolError::Execution(format!(
                 "agent-rt execution {} ended in state {}",
                 link.execution_id,
@@ -300,73 +345,72 @@ impl RemoteAgentRtExecutor {
 
     async fn start(
         &self,
-        request: &StartExecutionRequest,
+        message: StartExecutionRequest,
         token: &str,
         traceparent: Option<&str>,
-    ) -> Result<ExecutionApiRecord, RemoteTransportError> {
-        let mut builder = self
-            .client
-            .post(format!("{}/internal/v1/executions", self.endpoint()))
-            .bearer_auth(token)
-            .timeout(self.config.transport_timeout)
-            .json(request);
-        if let Some(traceparent) = traceparent {
-            builder = builder.header("traceparent", traceparent);
-        }
-        match builder.send().await {
-            Ok(response) => decode_response(response).await,
-            Err(error) => Err(RemoteTransportError::Ambiguous(error.to_string())),
-        }
-    }
-
-    async fn lookup(
-        &self,
-        link: &RemoteExecutionLink,
-        token: &str,
-        after_revision: Option<u64>,
-        wait: Duration,
-    ) -> Result<ExecutionApiRecord, RemoteTransportError> {
-        let mut request = self
-            .client
-            .get(format!(
-                "{}/internal/v1/executions/{}",
-                self.endpoint(),
-                link.execution_id
-            ))
-            .bearer_auth(token)
-            .timeout(self.config.transport_timeout + wait)
-            .query(&[("wait_ms", u64::try_from(wait.as_millis()).unwrap_or(u64::MAX))]);
-        if let Some(revision) = after_revision {
-            request = request.query(&[("after_revision", revision)]);
-        }
-        match request.send().await {
-            Ok(response) => decode_response(response).await,
-            Err(error) => Err(RemoteTransportError::Ambiguous(error.to_string())),
-        }
-    }
-
-    async fn cancel(
-        &self,
-        link: &RemoteExecutionLink,
-        token: &str,
-    ) -> Result<ExecutionApiRecord, RemoteTransportError> {
-        let response = self
-            .client
-            .post(format!(
-                "{}/internal/v1/executions/{}:cancel",
-                self.endpoint(),
-                link.execution_id
-            ))
-            .bearer_auth(token)
-            .timeout(self.config.transport_timeout)
-            .send()
+    ) -> Result<Execution, RemoteTransportError> {
+        let request = grpc_request(message, token, self.config.transport_timeout, traceparent)?;
+        ExecutionServiceClient::new(self.channel.clone())
+            .start_execution(request)
             .await
-            .map_err(|error| RemoteTransportError::Ambiguous(error.to_string()))?;
-        decode_response(response).await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| classify_status(&status))
     }
 
-    fn endpoint(&self) -> &str {
-        self.config.endpoint.trim_end_matches('/')
+    async fn lookup(&self, link: &RemoteExecutionLink, token: &str) -> Result<Execution, RemoteTransportError> {
+        let request = grpc_request(
+            GetExecutionRequest {
+                execution_id: link.execution_id.clone(),
+            },
+            token,
+            self.config.transport_timeout,
+            None,
+        )?;
+        ExecutionServiceClient::new(self.channel.clone())
+            .get_execution(request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| classify_status(&status))
+    }
+
+    async fn watch_once(
+        &self,
+        link: &RemoteExecutionLink,
+        token: &str,
+        after_revision: u64,
+    ) -> Result<Execution, RemoteTransportError> {
+        let request = grpc_request(
+            WatchExecutionRequest {
+                execution_id: link.execution_id.clone(),
+                after_revision,
+            },
+            token,
+            self.config.transport_timeout.saturating_add(self.config.lookup_wait),
+            None,
+        )?;
+        let mut stream = ExecutionServiceClient::new(self.channel.clone())
+            .watch_execution(request)
+            .await
+            .map_err(|status| classify_status(&status))?
+            .into_inner();
+        match tokio::time::timeout(self.config.lookup_wait, stream.message()).await {
+            Ok(Ok(Some(record))) => Ok(record),
+            Ok(Ok(None)) => self.lookup(link, token).await,
+            Ok(Err(status)) => Err(classify_status(&status)),
+            Err(_) => Err(RemoteTransportError::Ambiguous(
+                "execution watch timed out before a revision".to_owned(),
+            )),
+        }
+    }
+
+    async fn cancel(&self, link: &RemoteExecutionLink, token: &str) -> Result<Execution, RemoteTransportError> {
+        cancel_execution(
+            self.channel.clone(),
+            self.config.transport_timeout,
+            link.execution_id.clone(),
+            token,
+        )
+        .await
     }
 
     fn sign_subject(&self, link: &RemoteExecutionLink) -> Result<String, ToolError> {
@@ -384,38 +428,25 @@ impl RemoteAgentRtExecutor {
             serde_json::to_vec(&claims)
                 .map_err(|error| ToolError::Execution(format!("failed to encode subject assertion: {error}")))?,
         );
-        let signing_input = format!("v1.{payload}");
         let mut mac = Hmac::<Sha256>::new_from_slice(self.config.subject_signing_key.expose().as_bytes())
             .map_err(|_| ToolError::Config("invalid agent-rt subject signing key".to_owned()))?;
-        mac.update(signing_input.as_bytes());
+        mac.update(payload.as_bytes());
         let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-        Ok(format!("{signing_input}.{signature}"))
+        Ok(format!("{payload}.{signature}"))
     }
 }
 
-/// Sends best-effort cancellation when an in-flight remote executor future is
-/// dropped before it classifies an authoritative outcome. This covers caller
-/// disconnect, task abort, and runtime-local timeout without relying on the
-/// dropped future being polled again.
 struct RemoteCancelOnDrop {
-    client: Option<Arc<reqwest::Client>>,
-    endpoint: String,
+    channel: Option<Channel>,
     transport_timeout: Duration,
     execution_id: String,
     token: String,
 }
 
 impl RemoteCancelOnDrop {
-    fn new(
-        client: Arc<reqwest::Client>,
-        endpoint: String,
-        transport_timeout: Duration,
-        execution_id: String,
-        token: String,
-    ) -> Self {
+    fn new(channel: Channel, transport_timeout: Duration, execution_id: String, token: String) -> Self {
         Self {
-            client: Some(client),
-            endpoint,
+            channel: Some(channel),
             transport_timeout,
             execution_id,
             token,
@@ -423,16 +454,15 @@ impl RemoteCancelOnDrop {
     }
 
     fn disarm(&mut self) {
-        self.client = None;
+        self.channel = None;
     }
 }
 
 impl Drop for RemoteCancelOnDrop {
     fn drop(&mut self) {
-        let Some(client) = self.client.take() else {
+        let Some(channel) = self.channel.take() else {
             return;
         };
-        let endpoint = std::mem::take(&mut self.endpoint);
         let execution_id = std::mem::take(&mut self.execution_id);
         let token = std::mem::take(&mut self.token);
         let transport_timeout = self.transport_timeout;
@@ -440,14 +470,8 @@ impl Drop for RemoteCancelOnDrop {
             return;
         }
         tokio::spawn(async move {
-            let result = client
-                .post(format!("{endpoint}/internal/v1/executions/{execution_id}:cancel"))
-                .bearer_auth(token)
-                .timeout(transport_timeout)
-                .send()
-                .await;
-            if let Err(error) = result {
-                tracing::debug!(%execution_id, %error, "best-effort agent-rt cancellation failed");
+            if let Err(error) = cancel_execution(channel, transport_timeout, execution_id.clone(), &token).await {
+                tracing::debug!(%execution_id, ?error, "best-effort agent-rt cancellation failed");
             }
         });
     }
@@ -513,12 +537,12 @@ impl GatewayExecutor for RemoteAgentRtExecutor {
         _params: &Self::ExecutionParams,
     ) -> Option<OutputItem> {
         let arguments: CodeInterpreterArguments = serde_json::from_str(&call.arguments).ok()?;
-        let record: ExecutionApiRecord = serde_json::from_str(&output.output).ok()?;
+        let record: ExecutionOutcome = serde_json::from_str(&output.output).ok()?;
         let result = record.result.as_ref();
-        let mut logs = result.map_or_else(String::new, |result| result.output.stdout.clone());
+        let mut logs = result.map_or_else(String::new, |result| result.stdout.clone());
         if let Some(stderr) = result
-            .map(|result| result.output.stderr.as_str())
-            .filter(|stderr| !stderr.is_empty())
+            .map(|result| result.stderr.as_str())
+            .filter(|value| !value.is_empty())
         {
             if !logs.is_empty() && !logs.ends_with('\n') {
                 logs.push('\n');
@@ -533,7 +557,10 @@ impl GatewayExecutor for RemoteAgentRtExecutor {
                 .then_some(CodeInterpreterOutput::Logs { logs })
                 .into_iter()
                 .collect(),
-            status: if status == GatewayCallStatus::Completed && result.is_some_and(|result| !result.is_error) {
+            status: if status == GatewayCallStatus::Completed
+                && record.state == ExecutionOutcomeState::Completed
+                && result.is_some_and(|result| !result.is_error)
+            {
                 CodeInterpreterCallStatus::Completed
             } else {
                 CodeInterpreterCallStatus::Failed
@@ -560,14 +587,66 @@ pub(crate) fn code_interpreter_function_tool() -> FunctionTool {
     }
 }
 
+async fn cancel_execution(
+    channel: Channel,
+    timeout: Duration,
+    execution_id: String,
+    token: &str,
+) -> Result<Execution, RemoteTransportError> {
+    let request = grpc_request(CancelExecutionRequest { execution_id }, token, timeout, None)?;
+    ExecutionServiceClient::new(channel)
+        .cancel_execution(request)
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|status| classify_status(&status))
+}
+
+fn grpc_request<T>(
+    message: T,
+    token: &str,
+    timeout: Duration,
+    traceparent: Option<&str>,
+) -> Result<Request<T>, RemoteTransportError> {
+    let mut request = Request::new(message);
+    request.set_timeout(timeout);
+    let authorization =
+        MetadataValue::try_from(format!("Bearer {token}")).map_err(|error| RemoteTransportError::Rejected {
+            code: Code::InvalidArgument,
+            message: format!("invalid authorization metadata: {error}"),
+        })?;
+    request.metadata_mut().insert("authorization", authorization);
+    if let Some(traceparent) = traceparent {
+        let traceparent = MetadataValue::try_from(traceparent).map_err(|error| RemoteTransportError::Rejected {
+            code: Code::InvalidArgument,
+            message: format!("invalid traceparent metadata: {error}"),
+        })?;
+        request.metadata_mut().insert("traceparent", traceparent);
+    }
+    Ok(request)
+}
+
 fn request_fingerprint(route_id: &str, workspace_id: &str, code: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"agentic-api-agent-rt-request-v1");
+    hasher.update(b"agentic-api-agent-rt-request");
     for component in [route_id, workspace_id, "python", code] {
         hasher.update(&(component.len() as u64).to_le_bytes());
         hasher.update(component.as_bytes());
     }
     format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn classify_status(status: &Status) -> RemoteTransportError {
+    match status.code() {
+        Code::NotFound => RemoteTransportError::NotFound,
+        Code::AlreadyExists => RemoteTransportError::Conflict(status.message().to_owned()),
+        Code::Cancelled | Code::DeadlineExceeded | Code::Unavailable | Code::Unknown => {
+            RemoteTransportError::Ambiguous(status.to_string())
+        }
+        code => RemoteTransportError::Rejected {
+            code,
+            message: status.message().to_owned(),
+        },
+    }
 }
 
 fn remote_error(error: RemoteTransportError) -> ToolError {
@@ -576,36 +655,13 @@ fn remote_error(error: RemoteTransportError) -> ToolError {
             ToolError::Execution(format!("agent-rt execution identity conflict: {message}"))
         }
         RemoteTransportError::NotFound => ToolError::Execution("agent-rt execution was not found".to_owned()),
-        RemoteTransportError::Rejected { status, message } => {
-            ToolError::Execution(format!("agent-rt rejected execution ({status}): {message}"))
+        RemoteTransportError::Rejected { code, message } => {
+            ToolError::Execution(format!("agent-rt rejected execution ({code:?}): {message}"))
         }
         RemoteTransportError::Ambiguous(message) => {
             ToolError::Execution(format!("agent-rt transport outcome is ambiguous: {message}"))
         }
     }
-}
-
-async fn decode_response(response: reqwest::Response) -> Result<ExecutionApiRecord, RemoteTransportError> {
-    let status = response.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(RemoteTransportError::NotFound);
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| RemoteTransportError::Ambiguous(error.to_string()))?;
-    if status == reqwest::StatusCode::CONFLICT {
-        return Err(RemoteTransportError::Conflict(
-            String::from_utf8_lossy(&bytes).into_owned(),
-        ));
-    }
-    if !status.is_success() {
-        return Err(RemoteTransportError::Rejected {
-            status: status.as_u16(),
-            message: String::from_utf8_lossy(&bytes).into_owned(),
-        });
-    }
-    serde_json::from_slice(&bytes).map_err(|error| RemoteTransportError::Ambiguous(error.to_string()))
 }
 
 fn unix_seconds_i64() -> i64 {
@@ -633,47 +689,9 @@ struct SubjectClaims {
     token_id: String,
 }
 
-#[derive(Serialize)]
-struct StartExecutionRequest {
-    api_version: String,
-    execution_id: String,
-    workspace_id: String,
-    route_id: String,
-    input: SandboxCommandInput,
-    absolute_deadline: String,
-    limits: RequestedExecutionLimits,
-    provenance: ExecutionProvenance,
-}
-
-#[derive(Serialize)]
-struct SandboxCommandInput {
-    schema_version: String,
-    argv: Vec<String>,
-    cwd: Option<String>,
-    env: BTreeMap<String, String>,
-    stdin_base64: String,
-    artifact_paths: Vec<String>,
-}
-
-#[derive(Default, Serialize)]
-struct RequestedExecutionLimits {
-    max_output_bytes: Option<u64>,
-    max_artifact_bytes: Option<u64>,
-}
-
-#[derive(Serialize)]
-struct ExecutionProvenance {
-    #[serde(rename = "response_id")]
-    response: String,
-    #[serde(rename = "conversation_id")]
-    conversation: Option<String>,
-    #[serde(rename = "call_id")]
-    call: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum ExecutionApiState {
+enum ExecutionOutcomeState {
     Accepted,
     Running,
     Completed,
@@ -683,9 +701,9 @@ enum ExecutionApiState {
     OutcomeUnknown,
 }
 
-impl ExecutionApiState {
-    const fn is_known_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled | Self::TimedOut)
+impl ExecutionOutcomeState {
+    const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Accepted | Self::Running)
     }
 
     const fn as_str(self) -> &'static str {
@@ -702,55 +720,75 @@ impl ExecutionApiState {
 }
 
 #[derive(Deserialize, Serialize)]
-struct ExecutionApiRecord {
-    api_version: String,
+struct ExecutionOutcome {
     execution_id: String,
     workspace_id: String,
     route_id: String,
-    route_version: String,
-    request_fingerprint: String,
     revision: u64,
-    state: ExecutionApiState,
-    result: Option<SandboxCommandResult>,
-    failure: Option<serde_json::Value>,
-    #[serde(default)]
-    artifacts: Vec<serde_json::Value>,
-    accepted_at: String,
-    completed_at: Option<String>,
+    state: ExecutionOutcomeState,
+    result: Option<ExecutionResultProjection>,
+    failure_code: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
-struct SandboxCommandResult {
-    schema_version: String,
-    output: SandboxCommandOutput,
-    is_error: bool,
-}
-
-#[derive(Deserialize, Serialize)]
-struct SandboxCommandOutput {
+struct ExecutionResultProjection {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+    output_truncated: bool,
+    is_error: bool,
 }
 
+impl TryFrom<Execution> for ExecutionOutcome {
+    type Error = RemoteTransportError;
+
+    fn try_from(record: Execution) -> Result<Self, Self::Error> {
+        let state = match ExecutionState::try_from(record.state) {
+            Ok(ExecutionState::Accepted) => ExecutionOutcomeState::Accepted,
+            Ok(ExecutionState::Running) => ExecutionOutcomeState::Running,
+            Ok(ExecutionState::Succeeded) => ExecutionOutcomeState::Completed,
+            Ok(ExecutionState::Failed) => ExecutionOutcomeState::Failed,
+            Ok(ExecutionState::Cancelled) => ExecutionOutcomeState::Cancelled,
+            Ok(ExecutionState::TimedOut) => ExecutionOutcomeState::TimedOut,
+            Ok(ExecutionState::OutcomeUnknown) => ExecutionOutcomeState::OutcomeUnknown,
+            Ok(ExecutionState::Unspecified) | Err(_) => {
+                return Err(RemoteTransportError::Rejected {
+                    code: Code::Internal,
+                    message: "agent-rt returned an unknown execution state".to_owned(),
+                });
+            }
+        };
+        let result = record.result.map(|result| ExecutionResultProjection {
+            exit_code: result.exit_code,
+            stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+            output_truncated: result.output_truncated,
+            is_error: state != ExecutionOutcomeState::Completed
+                || result.exit_code.is_some_and(|exit_code| exit_code != 0),
+        });
+        Ok(Self {
+            execution_id: record.execution_id,
+            workspace_id: record.workspace_id,
+            route_id: record.route_id,
+            revision: record.revision,
+            state,
+            result,
+            failure_code: record.failure_code,
+        })
+    }
+}
+
+#[derive(Debug)]
 enum RemoteTransportError {
     NotFound,
     Conflict(String),
-    Rejected { status: u16, message: String },
+    Rejected { code: Code, message: String },
     Ambiguous(String),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use axum::extract::{Path, State};
-    use axum::http::HeaderMap;
-    use axum::routing::{get, post};
-    use tokio::sync::Mutex;
-
-    use super::*;
+    use super::request_fingerprint;
 
     #[test]
     fn request_fingerprint_is_bound_to_route_workspace_and_code() {
@@ -758,438 +796,5 @@ mod tests {
         assert_ne!(base, request_fingerprint("route-b", "workspace-a", "print(1)"));
         assert_ne!(base, request_fingerprint("route-a", "workspace-b", "print(1)"));
         assert_ne!(base, request_fingerprint("route-a", "workspace-a", "print(2)"));
-    }
-
-    #[derive(Clone, Default)]
-    struct FakeAgentRtState {
-        request: Arc<Mutex<Option<serde_json::Value>>>,
-        post_count: Arc<AtomicUsize>,
-        lookup_count: Arc<AtomicUsize>,
-        cancel_count: Arc<AtomicUsize>,
-        start_seen: Arc<tokio::sync::Notify>,
-    }
-
-    #[derive(Clone)]
-    struct RestartAgentRtState {
-        known_executions: Arc<Mutex<HashSet<String>>>,
-        physical_starts: Arc<AtomicUsize>,
-        post_attempts: Arc<AtomicUsize>,
-    }
-
-    async fn delayed_start(
-        State(state): State<FakeAgentRtState>,
-        headers: HeaderMap,
-        axum::Json(request): axum::Json<serde_json::Value>,
-    ) -> axum::Json<serde_json::Value> {
-        assert!(
-            headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("Bearer v1."))
-        );
-        state.post_count.fetch_add(1, Ordering::SeqCst);
-        *state.request.lock().await = Some(request.clone());
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        axum::Json(completed_record(&request))
-    }
-
-    async fn lookup_execution(
-        State(state): State<FakeAgentRtState>,
-        Path(execution_id): Path<String>,
-    ) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
-        state.lookup_count.fetch_add(1, Ordering::SeqCst);
-        let request = state.request.lock().await.clone();
-        let Some(request) = request else {
-            return Err(axum::http::StatusCode::NOT_FOUND);
-        };
-        assert_eq!(request["execution_id"], execution_id);
-        Ok(axum::Json(completed_record(&request)))
-    }
-
-    async fn accepted_start(
-        State(state): State<FakeAgentRtState>,
-        axum::Json(request): axum::Json<serde_json::Value>,
-    ) -> axum::Json<serde_json::Value> {
-        state.post_count.fetch_add(1, Ordering::SeqCst);
-        *state.request.lock().await = Some(request.clone());
-        state.start_seen.notify_one();
-        axum::Json(nonterminal_record(&request, "accepted", 1))
-    }
-
-    async fn running_lookup(
-        State(state): State<FakeAgentRtState>,
-        Path(execution_id): Path<String>,
-    ) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
-        state.lookup_count.fetch_add(1, Ordering::SeqCst);
-        let Some(request) = state.request.lock().await.clone() else {
-            return Err(axum::http::StatusCode::NOT_FOUND);
-        };
-        assert_eq!(request["execution_id"], execution_id);
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        Ok(axum::Json(nonterminal_record(&request, "running", 2)))
-    }
-
-    async fn cancel_execution(
-        State(state): State<FakeAgentRtState>,
-        Path(execution_action): Path<String>,
-    ) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
-        let execution_id = execution_action
-            .strip_suffix(":cancel")
-            .ok_or(axum::http::StatusCode::NOT_FOUND)?;
-        state.cancel_count.fetch_add(1, Ordering::SeqCst);
-        let Some(request) = state.request.lock().await.clone() else {
-            return Err(axum::http::StatusCode::NOT_FOUND);
-        };
-        assert_eq!(request["execution_id"], execution_id);
-        Ok(axum::Json(nonterminal_record(&request, "cancelled", 3)))
-    }
-
-    fn nonterminal_record(request: &serde_json::Value, state: &str, revision: u64) -> serde_json::Value {
-        serde_json::json!({
-            "api_version": "v1",
-            "execution_id": request["execution_id"],
-            "workspace_id": request["workspace_id"],
-            "route_id": request["route_id"],
-            "route_version": "blake3:route-v1",
-            "request_fingerprint": "blake3:agent-rt-fingerprint",
-            "revision": revision,
-            "state": state,
-            "result": null,
-            "failure": null,
-            "artifacts": [],
-            "accepted_at": "2026-09-01T00:00:00Z",
-            "completed_at": null
-        })
-    }
-
-    fn completed_record(request: &serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "api_version": "v1",
-            "execution_id": request["execution_id"],
-            "workspace_id": request["workspace_id"],
-            "route_id": request["route_id"],
-            "route_version": "blake3:route-v1",
-            "request_fingerprint": "blake3:agent-rt-fingerprint",
-            "revision": 2,
-            "state": "completed",
-            "result": {
-                "schema_version": "sandbox-command-result-v1",
-                "output": {"exit_code": 0, "stdout": "42\n", "stderr": ""},
-                "is_error": false
-            },
-            "failure": null,
-            "artifacts": [],
-            "accepted_at": "2026-09-01T00:00:00Z",
-            "completed_at": "2026-09-01T00:00:01Z"
-        })
-    }
-
-    async fn create_or_get_after_restart(
-        State(state): State<RestartAgentRtState>,
-        axum::Json(request): axum::Json<serde_json::Value>,
-    ) -> axum::Json<serde_json::Value> {
-        state.post_attempts.fetch_add(1, Ordering::SeqCst);
-        let execution_id = request["execution_id"].as_str().expect("execution ID").to_owned();
-        if state.known_executions.lock().await.insert(execution_id) {
-            state.physical_starts.fetch_add(1, Ordering::SeqCst);
-        }
-        axum::Json(completed_record(&request))
-    }
-
-    #[tokio::test]
-    async fn ambiguous_start_is_reconciled_by_lookup_without_redispatch() {
-        let fake = FakeAgentRtState::default();
-        let app = axum::Router::new()
-            .route("/internal/v1/executions", post(delayed_start))
-            .route("/internal/v1/executions/{execution_id}", get(lookup_execution))
-            .with_state(fake.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind fake agent-rt");
-        let address = listener.local_addr().expect("fake agent-rt address");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-
-        let pool = crate::storage::create_pool_with_schema(Some("sqlite::memory:"))
-            .await
-            .expect("create execution ledger");
-        let executor = RemoteAgentRtExecutor::new(
-            Arc::new(reqwest::Client::new()),
-            AgentRtExecutorConfig {
-                endpoint: format!("http://{address}"),
-                route_id: "sandbox.python.default".to_owned(),
-                subject_signing_key: crate::config::SubjectSigningKey::new(
-                    "0123456789abcdef0123456789abcdef".to_owned(),
-                ),
-                subject_issuer: "agentic-api".to_owned(),
-                subject_audience: "agent-rt".to_owned(),
-                tenant_id: "tenant-a".to_owned(),
-                default_principal_id: "principal-a".to_owned(),
-                execution_timeout: Duration::from_secs(2),
-                transport_timeout: Duration::from_millis(20),
-                lookup_wait: Duration::from_millis(10),
-            },
-            RemoteExecutionLedger::new(pool.clone()),
-        )
-        .expect("remote executor");
-        let subject = crate::tool::AuthenticatedSubject {
-            tenant_id: "tenant-a".to_owned(),
-            principal_id: "principal-a".to_owned(),
-        };
-        let (execution_id, workspace_id) = crate::storage::remote_execution::stable_execution_identity(
-            Some(&subject),
-            "resp-a",
-            Some("conv-a"),
-            "call-a",
-        );
-        let context = GatewayExecutionContext {
-            response_id: "resp-a".to_owned(),
-            conversation_id: Some("conv-a".to_owned()),
-            call_id: "call-a".to_owned(),
-            execution_id,
-            workspace_id,
-            subject: Some(subject),
-            absolute_deadline: Some(SystemTime::now() + Duration::from_secs(2)),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            trace_context: crate::tool::TraceContext::default(),
-        };
-
-        let output = executor
-            .execute_remote(context, r#"{"code":"print(40 + 2)"}"#)
-            .await
-            .expect("lookup recovers completed result");
-        assert_eq!(fake.post_count.load(Ordering::SeqCst), 1);
-        assert_eq!(fake.lookup_count.load(Ordering::SeqCst), 1);
-        let request = fake.request.lock().await.clone().expect("captured request");
-        assert_eq!(request["route_id"], "sandbox.python.default");
-        assert_eq!(
-            request["input"]["argv"],
-            serde_json::json!(["python", "-c", "print(40 + 2)"])
-        );
-        assert!(request.get("provider").is_none());
-        assert!(request.get("credentials").is_none());
-
-        let state: String = sqlx::query_scalar("SELECT state FROM remote_executions WHERE call_id = $1")
-            .bind("call-a")
-            .fetch_one(pool.as_ref())
-            .await
-            .expect("load persisted terminal state");
-        assert_eq!(state, "completed");
-
-        let public = executor
-            .public_output(
-                &FunctionToolCall {
-                    id: "ci-a".to_owned(),
-                    call_id: "call-a".to_owned(),
-                    name: "code_interpreter".to_owned(),
-                    namespace: None,
-                    arguments: r#"{"code":"print(40 + 2)"}"#.to_owned(),
-                    status: crate::types::event::MessageStatus::Completed,
-                },
-                &output,
-                GatewayCallStatus::Completed,
-                &CodeInterpreterToolParam::default(),
-            )
-            .expect("native public item");
-        let OutputItem::CodeInterpreterCall(public) = public else {
-            panic!("expected native code interpreter output");
-        };
-        assert_eq!(public.status, CodeInterpreterCallStatus::Completed);
-        assert!(matches!(
-            public.outputs.as_slice(),
-            [CodeInterpreterOutput::Logs { logs }] if logs == "42\n"
-        ));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn dropping_in_flight_remote_execution_sends_best_effort_cancel() {
-        let fake = FakeAgentRtState::default();
-        let app = axum::Router::new()
-            .route("/internal/v1/executions", post(accepted_start))
-            .route(
-                "/internal/v1/executions/{execution_id}",
-                get(running_lookup).post(cancel_execution),
-            )
-            .with_state(fake.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind fake agent-rt");
-        let address = listener.local_addr().expect("fake agent-rt address");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        let pool = crate::storage::create_pool_with_schema(Some("sqlite::memory:"))
-            .await
-            .expect("create execution ledger");
-        let executor = RemoteAgentRtExecutor::new(
-            Arc::new(reqwest::Client::new()),
-            AgentRtExecutorConfig {
-                endpoint: format!("http://{address}"),
-                route_id: "sandbox.python.default".to_owned(),
-                subject_signing_key: crate::config::SubjectSigningKey::new(
-                    "0123456789abcdef0123456789abcdef".to_owned(),
-                ),
-                subject_issuer: "agentic-api".to_owned(),
-                subject_audience: "agent-rt".to_owned(),
-                tenant_id: "tenant-a".to_owned(),
-                default_principal_id: "principal-a".to_owned(),
-                execution_timeout: Duration::from_secs(30),
-                transport_timeout: Duration::from_millis(250),
-                lookup_wait: Duration::from_secs(5),
-            },
-            RemoteExecutionLedger::new(pool),
-        )
-        .expect("remote executor");
-        let subject = crate::tool::AuthenticatedSubject {
-            tenant_id: "tenant-a".to_owned(),
-            principal_id: "principal-a".to_owned(),
-        };
-        let (execution_id, workspace_id) = crate::storage::remote_execution::stable_execution_identity(
-            Some(&subject),
-            "resp-cancel",
-            Some("conv-cancel"),
-            "call-cancel",
-        );
-        let context = GatewayExecutionContext {
-            response_id: "resp-cancel".to_owned(),
-            conversation_id: Some("conv-cancel".to_owned()),
-            call_id: "call-cancel".to_owned(),
-            execution_id,
-            workspace_id,
-            subject: Some(subject),
-            absolute_deadline: Some(SystemTime::now() + Duration::from_secs(30)),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            trace_context: crate::tool::TraceContext::default(),
-        };
-
-        let execution =
-            tokio::spawn(async move { executor.execute_remote(context, r#"{"code":"while True: pass"}"#).await });
-        tokio::time::timeout(Duration::from_secs(2), fake.start_seen.notified())
-            .await
-            .expect("remote start was not accepted");
-        execution.abort();
-        let _ = execution.await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while fake.cancel_count.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("best-effort cancel was not sent");
-        assert_eq!(fake.cancel_count.load(Ordering::SeqCst), 1);
-        assert_eq!(fake.post_count.load(Ordering::SeqCst), 1);
-        server.abort();
-    }
-
-    fn remove_sqlite_test_database(database_path: &std::path::Path) {
-        std::fs::remove_file(database_path).expect("remove restart test database");
-        for suffix in ["-shm", "-wal"] {
-            let sidecar = format!("{}{suffix}", database_path.display());
-            if std::path::Path::new(&sidecar).exists() {
-                std::fs::remove_file(sidecar).expect("remove SQLite restart sidecar");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn process_restart_reuses_durable_ledger_and_existing_remote_execution() {
-        let subject = crate::tool::AuthenticatedSubject {
-            tenant_id: "tenant-a".to_owned(),
-            principal_id: "principal-a".to_owned(),
-        };
-        let (execution_id, workspace_id) = crate::storage::remote_execution::stable_execution_identity(
-            Some(&subject),
-            "resp-restart",
-            Some("conv-restart"),
-            "call-restart",
-        );
-        let fingerprint = request_fingerprint("sandbox.python.default", &workspace_id, "print(42)");
-        let database_path = std::env::temp_dir().join(format!("agentic-api-restart-{}.db", uuid::Uuid::now_v7()));
-        let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
-        let first_pool = crate::storage::create_pool_with_schema(Some(&database_url))
-            .await
-            .expect("create durable execution ledger");
-        let first_ledger = RemoteExecutionLedger::new(first_pool.clone());
-        let first_link = first_ledger
-            .claim(crate::storage::ClaimRemoteExecution {
-                subject: &subject,
-                response_id: "resp-restart",
-                conversation_id: Some("conv-restart"),
-                call_id: "call-restart",
-                route_id: "sandbox.python.default",
-                request_fingerprint: &fingerprint,
-                absolute_deadline: unix_seconds_i64() + 30,
-            })
-            .await
-            .expect("first process durably claimed call before dispatch");
-        assert_eq!(first_link.execution_id, execution_id);
-        drop(first_ledger);
-        first_pool.close().await;
-
-        let state = RestartAgentRtState {
-            known_executions: Arc::new(Mutex::new(HashSet::from([execution_id.clone()]))),
-            physical_starts: Arc::new(AtomicUsize::new(1)),
-            post_attempts: Arc::new(AtomicUsize::new(0)),
-        };
-        let app = axum::Router::new()
-            .route("/internal/v1/executions", post(create_or_get_after_restart))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind fake agent-rt");
-        let address = listener.local_addr().expect("fake agent-rt address");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        let recovered_pool = crate::storage::create_pool_with_schema(Some(&database_url))
-            .await
-            .expect("reopen execution ledger after process restart");
-        let executor = RemoteAgentRtExecutor::new(
-            Arc::new(reqwest::Client::new()),
-            AgentRtExecutorConfig {
-                endpoint: format!("http://{address}"),
-                route_id: "sandbox.python.default".to_owned(),
-                subject_signing_key: crate::config::SubjectSigningKey::new(
-                    "0123456789abcdef0123456789abcdef".to_owned(),
-                ),
-                subject_issuer: "agentic-api".to_owned(),
-                subject_audience: "agent-rt".to_owned(),
-                tenant_id: "tenant-a".to_owned(),
-                default_principal_id: "principal-a".to_owned(),
-                execution_timeout: Duration::from_secs(30),
-                transport_timeout: Duration::from_millis(250),
-                lookup_wait: Duration::from_millis(10),
-            },
-            RemoteExecutionLedger::new(recovered_pool.clone()),
-        )
-        .expect("recovered remote executor");
-        let context = GatewayExecutionContext {
-            response_id: "resp-restart".to_owned(),
-            conversation_id: Some("conv-restart".to_owned()),
-            call_id: "call-restart".to_owned(),
-            execution_id,
-            workspace_id,
-            subject: Some(subject),
-            absolute_deadline: Some(SystemTime::now() + Duration::from_secs(30)),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            trace_context: crate::tool::TraceContext::default(),
-        };
-
-        executor
-            .execute_remote(context, r#"{"code":"print(42)"}"#)
-            .await
-            .expect("restarted process reconciles existing physical execution");
-        assert_eq!(state.post_attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(state.physical_starts.load(Ordering::SeqCst), 1);
-        let ledger_state: String = sqlx::query_scalar("SELECT state FROM remote_executions")
-            .fetch_one(recovered_pool.as_ref())
-            .await
-            .expect("recovered process persisted terminal state");
-        assert_eq!(ledger_state, "completed");
-        recovered_pool.close().await;
-        remove_sqlite_test_database(&database_path);
-        server.abort();
     }
 }
