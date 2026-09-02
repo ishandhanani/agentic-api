@@ -19,9 +19,9 @@ use shed_control::execution_service_server::{ExecutionService, ExecutionServiceS
 use shed_control::workspace_file_service_server::{WorkspaceFileService, WorkspaceFileServiceServer};
 use shed_control::workspace_service_server::{WorkspaceService, WorkspaceServiceServer};
 use shed_control::{
-    CancelExecutionRequest, Capability, CreateWorkspaceRequest, DeleteWorkspaceRequest, Execution, ExecutionResult,
-    ExecutionState, FileChunk, FileMetadata, GetExecutionRequest, GetWorkspaceRequest, ListFilesRequest,
-    ListFilesResponse, ReadFileRequest, RemoveFileRequest, RemoveFileResponse, StartExecutionRequest, StatFileRequest,
+    CancelExecutionRequest, CreateWorkspaceRequest, DeleteWorkspaceRequest, Execution, ExecutionResult, ExecutionState,
+    FileChunk, FileMetadata, GetExecutionRequest, GetWorkspaceRequest, ListFilesRequest, ListFilesResponse,
+    ReadFileRequest, RemoveFileRequest, RemoveFileResponse, StartExecutionRequest, StatFileRequest,
     WatchExecutionRequest, Workspace, WorkspaceState, WriteFileRequest,
 };
 use tokio::sync::Mutex;
@@ -108,10 +108,7 @@ impl WorkspaceService for ShedState {
             created_at_unix_millis: 1,
             last_active_at_unix_millis: 1,
             expires_at_unix_millis: None,
-            capabilities: vec![Capability {
-                name: "command.execute".to_owned(),
-                version: 1,
-            }],
+            capabilities: vec!["command.execute".to_owned()],
             failure_code: None,
         }))
     }
@@ -128,10 +125,7 @@ impl WorkspaceService for ShedState {
             created_at_unix_millis: 1,
             last_active_at_unix_millis: 1,
             expires_at_unix_millis: None,
-            capabilities: vec![Capability {
-                name: "command.execute".to_owned(),
-                version: 1,
-            }],
+            capabilities: vec!["command.execute".to_owned()],
             failure_code: None,
         }))
     }

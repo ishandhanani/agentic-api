@@ -30,9 +30,8 @@ use futures::Stream;
 use shed_control::execution_service_server::{ExecutionService, ExecutionServiceServer};
 use shed_control::workspace_service_server::{WorkspaceService, WorkspaceServiceServer};
 use shed_control::{
-    CancelExecutionRequest, Capability, CreateWorkspaceRequest, DeleteWorkspaceRequest, Execution, ExecutionResult,
-    ExecutionState, GetExecutionRequest, GetWorkspaceRequest, StartExecutionRequest, WatchExecutionRequest, Workspace,
-    WorkspaceState,
+    CancelExecutionRequest, CreateWorkspaceRequest, DeleteWorkspaceRequest, Execution, ExecutionResult, ExecutionState,
+    GetExecutionRequest, GetWorkspaceRequest, StartExecutionRequest, WatchExecutionRequest, Workspace, WorkspaceState,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -93,10 +92,7 @@ impl WorkspaceService for BenchShed {
             created_at_unix_millis: 1,
             last_active_at_unix_millis: 1,
             expires_at_unix_millis: None,
-            capabilities: vec![Capability {
-                name: "command.execute".to_owned(),
-                version: 1,
-            }],
+            capabilities: vec!["command.execute".to_owned()],
             failure_code: None,
         }))
     }
