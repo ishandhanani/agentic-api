@@ -155,7 +155,7 @@ Handlers make a request-scoped decision between two paths:
 - **Transparent proxy path** — everything else is forwarded to vLLM unchanged via
   `agentic_core::proxy`, with no state, no persistence.
 
-Container handlers are a third, explicit adapter path. Agentic API owns the subject-scoped public container/file catalog and pagination; a configured agent-rt service owns physical workspace lifecycle and file I/O over gRPC. Container identity is independent from Responses and conversation identity. Unsupported dynamic workspace policies fail validation instead of leaking provider configuration into the public API.
+Container handlers are a third, explicit adapter path. Agentic API owns the subject-scoped public container/file catalog and pagination; a configured shed service owns physical workspace lifecycle and file I/O over gRPC. Container identity is independent from Responses and conversation identity. Unsupported dynamic workspace policies fail validation instead of leaking provider configuration into the public API.
 
 ### WebSocket transport (`handler/websocket/`)
 

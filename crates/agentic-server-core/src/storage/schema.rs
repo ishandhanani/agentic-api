@@ -193,11 +193,11 @@ where
              VALUES \
                  ('tenant_id', 'NO'), ('principal_id', 'NO'), ('response_id', 'NO'), \
                  ('conversation_id', 'YES'), ('call_id', 'NO'), ('execution_id', 'NO'), \
-                 ('workspace_id', 'NO'), ('route_id', 'NO'), ('request_fingerprint', 'NO'), \
+                 ('workspace_id', 'NO'), ('request_fingerprint', 'NO'), \
                  ('absolute_deadline', 'NO'), ('state', 'NO'), ('terminal_outcome', 'YES'), \
                  ('created_at', 'NO'), ('updated_at', 'NO') \
          ) \
-         SELECT COUNT(*) = 14 \
+         SELECT COUNT(*) = 13 \
          FROM required \
          JOIN information_schema.columns actual \
            ON actual.table_name = 'remote_executions' \
@@ -223,7 +223,7 @@ where
         "WITH required(column_name, is_nullable) AS ( \
              VALUES \
                  ('tenant_id', 'NO'), ('principal_id', 'NO'), ('id', 'NO'), \
-                 ('name', 'NO'), ('workspace_class_id', 'NO'), ('memory_limit', 'NO'), ('status', 'NO'), \
+                 ('name', 'NO'), ('profile_id', 'NO'), ('memory_limit', 'NO'), ('status', 'NO'), \
                  ('expires_after_minutes', 'YES'), ('created_at', 'NO'), \
                  ('last_active_at', 'NO'), ('expires_at', 'YES'), ('deleted_at', 'YES') \
          ) \
@@ -446,9 +446,9 @@ pub(crate) async fn verify_persistence_writable(pool: &DbPool) -> DbResult<()> {
         sqlx::query(
             "INSERT INTO remote_executions (
                  tenant_id, principal_id, response_id, call_id, execution_id,
-                 workspace_id, route_id, request_fingerprint, absolute_deadline,
+                 workspace_id, request_fingerprint, absolute_deadline,
                  state, created_at, updated_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'claimed', $10, $10)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'claimed', $9, $9)",
         )
         .bind("readiness")
         .bind("readiness")
@@ -457,14 +457,13 @@ pub(crate) async fn verify_persistence_writable(pool: &DbPool) -> DbResult<()> {
         .bind(format!("exec_{suffix}"))
         .bind(format!("ws_{suffix}"))
         .bind("readiness")
-        .bind("readiness")
         .bind(created_at.saturating_add(60))
         .bind(created_at)
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
             "INSERT INTO containers (
-                 tenant_id, principal_id, id, name, workspace_class_id, memory_limit, status,
+                 tenant_id, principal_id, id, name, profile_id, memory_limit, status,
                  created_at, last_active_at
              ) VALUES ($1, $2, $3, $4, $5, $6, 'creating', $7, $7)",
         )

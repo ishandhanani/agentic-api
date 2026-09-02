@@ -2,4 +2,4 @@
 
 #![allow(clippy::all, clippy::pedantic)]
 
-tonic::include_proto!("agent_rt.control");
+tonic::include_proto!("shed.control");

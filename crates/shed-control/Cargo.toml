@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "agent-rt-control"
+name = "shed-control"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Generated client contract for the agent-rt execution control plane."
+description = "Generated client contract for the shed execution control plane."
 publish = false
 
 [dependencies]

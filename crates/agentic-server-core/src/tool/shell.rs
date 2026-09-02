@@ -3,11 +3,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use agent_rt_control::Command;
 use serde::Deserialize;
+use shed_control::Command;
 
-use super::agent_rt::{
-    AgentRtClient, AgentRtExecutor, ExecutionOutcome, ExecutionOutcomeState, RemoteCommand, WorkspaceResolution,
+use super::shed::{
+    ExecutionOutcome, ExecutionOutcomeState, RemoteCommand, ShedClient, ShedExecutor, WorkspaceResolution,
 };
 use super::{
     GatewayExecutionContext, GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput, ToolType,
@@ -17,31 +17,31 @@ use crate::types::io::{
     ShellCallOutcome, ShellCallOutput, ShellCallOutputContent, ShellCallStatus,
 };
 use crate::types::tools::{ShellAllowedCallerParam, ShellEnvironmentParam, ShellToolParam};
-use crate::{config::AgentRtExecutorConfig, storage::RemoteExecutionLedger};
+use crate::{config::ShedExecutorConfig, storage::RemoteExecutionLedger};
 
 const DEFAULT_MAX_OUTPUT_LENGTH: u64 = 4_096;
 const MAX_COMMANDS_PER_CALL: usize = 64;
 
 #[derive(Clone, Debug)]
-pub struct AgentRtShellExecutor {
-    inner: AgentRtExecutor,
+pub struct ShedShellExecutor {
+    inner: ShedExecutor,
 }
 
-impl AgentRtShellExecutor {
-    /// Builds the Shell executor over the private agent-rt control plane.
+impl ShedShellExecutor {
+    /// Builds the Shell executor over the private shed control plane.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Config`] when the agent-rt client configuration is invalid.
-    pub fn new(config: AgentRtExecutorConfig, ledger: RemoteExecutionLedger) -> Result<Self, ToolError> {
+    /// Returns [`ToolError::Config`] when the shed client configuration is invalid.
+    pub fn new(config: ShedExecutorConfig, ledger: RemoteExecutionLedger) -> Result<Self, ToolError> {
         Ok(Self {
-            inner: AgentRtExecutor::new(config, ledger)?,
+            inner: ShedExecutor::new(config, ledger)?,
         })
     }
 
-    pub(crate) fn from_client(client: AgentRtClient, ledger: RemoteExecutionLedger) -> Self {
+    pub(crate) fn from_client(client: ShedClient, ledger: RemoteExecutionLedger) -> Self {
         Self {
-            inner: AgentRtExecutor::from_client(client, ledger),
+            inner: ShedExecutor::from_client(client, ledger),
         }
     }
 
@@ -78,7 +78,7 @@ impl AgentRtShellExecutor {
             None | Some(ShellEnvironmentParam::ContainerAuto { .. }) => WorkspaceResolution::CreateOrGet,
             Some(ShellEnvironmentParam::Local { .. }) => {
                 return Err(ToolError::Config(
-                    "environment.local is client-executed and cannot be handled by agent-rt".to_owned(),
+                    "environment.local is client-executed and cannot be handled by shed".to_owned(),
                 ));
             }
         };
@@ -88,7 +88,7 @@ impl AgentRtShellExecutor {
     }
 }
 
-impl ToolHandler for AgentRtShellExecutor {
+impl ToolHandler for ShedShellExecutor {
     type ToolParams = ShellToolParam;
 
     fn tool_type(&self) -> ToolType {
@@ -111,11 +111,10 @@ impl ToolHandler for AgentRtShellExecutor {
                 Ok(())
             }
             Some(ShellEnvironmentParam::ContainerAuto { .. }) => Err(ToolError::Config(
-                "agent-rt workspace classes own files, memory, and network policy; omit container_auto overrides"
-                    .to_owned(),
+                "shed profiles own files, memory, and network policy; omit container_auto overrides".to_owned(),
             )),
             Some(ShellEnvironmentParam::Local { .. }) => Err(ToolError::Config(
-                "environment.local is client-executed and cannot be handled by agent-rt".to_owned(),
+                "environment.local is client-executed and cannot be handled by shed".to_owned(),
             )),
         }
     }
@@ -142,7 +141,7 @@ fn validate_direct_callers(params: &ShellToolParam) -> Result<(), ToolError> {
     Ok(())
 }
 
-impl GatewayExecutor for AgentRtShellExecutor {
+impl GatewayExecutor for ShedShellExecutor {
     type ExecutionParams = ShellToolParam;
 
     fn execute(
@@ -351,10 +350,10 @@ pub(crate) fn shell_function_tool() -> FunctionTool {
                     "minItems": 1,
                     "maxItems": MAX_COMMANDS_PER_CALL
                 },
-                "timeout_ms": {"type": "integer", "minimum": 1},
-                "max_output_length": {"type": "integer", "minimum": 1}
+                "timeout_ms": {"type": ["integer", "null"], "minimum": 1},
+                "max_output_length": {"type": ["integer", "null"], "minimum": 1}
             },
-            "required": ["commands"],
+            "required": ["commands", "timeout_ms", "max_output_length"],
             "additionalProperties": false
         })),
         strict: Some(true),

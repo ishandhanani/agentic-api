@@ -15,7 +15,6 @@ pub struct RemoteExecutionLink {
     pub call_id: String,
     pub execution_id: String,
     pub workspace_id: String,
-    pub route_id: String,
     pub request_fingerprint: String,
     pub absolute_deadline: i64,
     pub state: String,
@@ -28,7 +27,6 @@ pub struct ClaimRemoteExecution<'a> {
     pub conversation_id: Option<&'a str>,
     pub call_id: &'a str,
     pub workspace_id: &'a str,
-    pub route_id: &'a str,
     pub request_fingerprint: &'a str,
     pub absolute_deadline: i64,
 }
@@ -76,9 +74,9 @@ impl RemoteExecutionLedger {
         sqlx::query(
             "INSERT INTO remote_executions (
                  tenant_id, principal_id, response_id, conversation_id, call_id,
-                 execution_id, workspace_id, route_id, request_fingerprint,
+                 execution_id, workspace_id, request_fingerprint,
                  absolute_deadline, state, created_at, updated_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'claimed', $11, $11)
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'claimed', $10, $10)
              ON CONFLICT (tenant_id, principal_id, response_id, call_id) DO NOTHING",
         )
         .bind(&claim.subject.tenant_id)
@@ -88,7 +86,6 @@ impl RemoteExecutionLedger {
         .bind(claim.call_id)
         .bind(&execution_id)
         .bind(claim.workspace_id)
-        .bind(claim.route_id)
         .bind(claim.request_fingerprint)
         .bind(claim.absolute_deadline)
         .bind(now)
@@ -97,8 +94,7 @@ impl RemoteExecutionLedger {
         let link = load_in_transaction(&mut transaction, claim.subject, claim.response_id, claim.call_id)
             .await?
             .ok_or(RemoteExecutionLedgerError::NotFound)?;
-        if link.route_id != claim.route_id
-            || link.workspace_id != claim.workspace_id
+        if link.workspace_id != claim.workspace_id
             || link.request_fingerprint != claim.request_fingerprint
             || link.conversation_id.as_deref() != claim.conversation_id
         {
@@ -148,7 +144,7 @@ async fn load_in_transaction(
 ) -> Result<Option<RemoteExecutionLink>, sqlx::Error> {
     let row = sqlx::query_as::<_, RemoteExecutionRow>(
         "SELECT tenant_id, principal_id, response_id, conversation_id, call_id,
-                execution_id, workspace_id, route_id, request_fingerprint,
+                execution_id, workspace_id, request_fingerprint,
                 absolute_deadline, state, terminal_outcome
          FROM remote_executions
          WHERE tenant_id = $1 AND principal_id = $2 AND response_id = $3 AND call_id = $4",
@@ -171,7 +167,6 @@ struct RemoteExecutionRow {
     call_id: String,
     execution_id: String,
     workspace_id: String,
-    route_id: String,
     request_fingerprint: String,
     absolute_deadline: i64,
     state: String,
@@ -188,7 +183,6 @@ impl From<RemoteExecutionRow> for RemoteExecutionLink {
             call_id: row.call_id,
             execution_id: row.execution_id,
             workspace_id: row.workspace_id,
-            route_id: row.route_id,
             request_fingerprint: row.request_fingerprint,
             absolute_deadline: row.absolute_deadline,
             state: row.state,
@@ -252,7 +246,6 @@ mod tests {
             conversation_id: Some("conv-a"),
             call_id: "call-a",
             workspace_id: "ws-explicit",
-            route_id: "sandbox.python.default",
             request_fingerprint: "blake3:request-a",
             absolute_deadline: 2_000_000_000,
         };

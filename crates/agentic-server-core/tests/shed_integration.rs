@@ -5,17 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use agent_rt_control::execution_service_server::{ExecutionService, ExecutionServiceServer};
-use agent_rt_control::workspace_file_service_server::{WorkspaceFileService, WorkspaceFileServiceServer};
-use agent_rt_control::workspace_service_server::{WorkspaceService, WorkspaceServiceServer};
-use agent_rt_control::{
-    CancelExecutionRequest, Capability, CreateWorkspaceRequest, DeleteWorkspaceRequest, Execution, ExecutionResult,
-    ExecutionState, FileChunk, FileMetadata, GetExecutionRequest, GetWorkspaceRequest, ListFilesRequest,
-    ListFilesResponse, ReadFileRequest, RemoveFileRequest, RemoveFileResponse, StartExecutionRequest, StatFileRequest,
-    WatchExecutionRequest, Workspace, WorkspaceState, WriteFileRequest,
-};
 use agentic_core::config::{
-    AgentRtExecutorConfig, Config, PostgresConfig, SqliteConfig, SubjectSigningKey, ToolRuntimeConfig,
+    Config, PostgresConfig, ShedExecutorConfig, SqliteConfig, SubjectSigningKey, ToolRuntimeConfig,
 };
 use agentic_core::executor::{ExecuteRequest, ExecutionContext};
 use agentic_core::types::io::{OutputItem, ShellCallEnvironment, ShellCallOutcome, ShellCallStatus};
@@ -24,6 +15,15 @@ use axum::extract::State;
 use axum::routing::post;
 use either::Either;
 use futures::{Stream, TryStreamExt};
+use shed_control::execution_service_server::{ExecutionService, ExecutionServiceServer};
+use shed_control::workspace_file_service_server::{WorkspaceFileService, WorkspaceFileServiceServer};
+use shed_control::workspace_service_server::{WorkspaceService, WorkspaceServiceServer};
+use shed_control::{
+    CancelExecutionRequest, Capability, CreateWorkspaceRequest, DeleteWorkspaceRequest, Execution, ExecutionResult,
+    ExecutionState, FileChunk, FileMetadata, GetExecutionRequest, GetWorkspaceRequest, ListFilesRequest,
+    ListFilesResponse, ReadFileRequest, RemoveFileRequest, RemoveFileResponse, StartExecutionRequest, StatFileRequest,
+    WatchExecutionRequest, Workspace, WorkspaceState, WriteFileRequest,
+};
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
@@ -76,7 +76,7 @@ async fn inference(
 }
 
 #[derive(Clone, Default)]
-struct AgentRtState {
+struct ShedState {
     workspace_requests: Arc<Mutex<Vec<CreateWorkspaceRequest>>>,
     execution_requests: Arc<Mutex<Vec<StartExecutionRequest>>>,
     file_write_requests: Arc<Mutex<Vec<WriteFileRequest>>>,
@@ -94,15 +94,15 @@ fn assert_subject<T>(request: &Request<T>) {
 }
 
 #[tonic::async_trait]
-impl WorkspaceService for AgentRtState {
+impl WorkspaceService for ShedState {
     async fn create_workspace(&self, request: Request<CreateWorkspaceRequest>) -> Result<Response<Workspace>, Status> {
         assert_subject(&request);
         let request = request.into_inner();
         self.workspace_requests.lock().await.push(request.clone());
         Ok(Response::new(Workspace {
             workspace_id: request.workspace_id,
-            workspace_class_id: request.workspace_class_id,
-            workspace_class_revision: "python.default@sha256:test".to_owned(),
+            profile_id: request.profile_id,
+            profile_revision: "python.default@sha256:test".to_owned(),
             state: WorkspaceState::Ready as i32,
             revision: 1,
             created_at_unix_millis: 1,
@@ -121,8 +121,8 @@ impl WorkspaceService for AgentRtState {
         let request = request.into_inner();
         Ok(Response::new(Workspace {
             workspace_id: request.workspace_id,
-            workspace_class_id: "python.default".to_owned(),
-            workspace_class_revision: "python.default@sha256:test".to_owned(),
+            profile_id: "python.default".to_owned(),
+            profile_revision: "python.default@sha256:test".to_owned(),
             state: WorkspaceState::Ready as i32,
             revision: 1,
             created_at_unix_millis: 1,
@@ -141,8 +141,8 @@ impl WorkspaceService for AgentRtState {
         let request = request.into_inner();
         Ok(Response::new(Workspace {
             workspace_id: request.workspace_id,
-            workspace_class_id: "python.default".to_owned(),
-            workspace_class_revision: "python.default@sha256:test".to_owned(),
+            profile_id: "python.default".to_owned(),
+            profile_revision: "python.default@sha256:test".to_owned(),
             state: WorkspaceState::Deleted as i32,
             revision: 2,
             created_at_unix_millis: 1,
@@ -155,7 +155,7 @@ impl WorkspaceService for AgentRtState {
 }
 
 #[tonic::async_trait]
-impl WorkspaceFileService for AgentRtState {
+impl WorkspaceFileService for ShedState {
     async fn stat_file(&self, request: Request<StatFileRequest>) -> Result<Response<FileMetadata>, Status> {
         assert_subject(&request);
         let request = request.into_inner();
@@ -236,7 +236,7 @@ fn file_metadata(path: String, size: usize) -> FileMetadata {
 }
 
 #[tonic::async_trait]
-impl ExecutionService for AgentRtState {
+impl ExecutionService for ShedState {
     type WatchExecutionStream = Pin<Box<dyn Stream<Item = Result<Execution, Status>> + Send + 'static>>;
 
     async fn start_execution(&self, request: Request<StartExecutionRequest>) -> Result<Response<Execution>, Status> {
@@ -259,7 +259,6 @@ impl ExecutionService for AgentRtState {
         Ok(Response::new(Execution {
             execution_id: request.execution_id,
             workspace_id: request.workspace_id,
-            route_id: request.route_id,
             revision: 2,
             state: ExecutionState::Succeeded as i32,
             result: Some(ExecutionResult {
@@ -302,7 +301,7 @@ async fn serve_http(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) 
     (format!("http://{address}"), server)
 }
 
-async fn serve_agent_rt(state: AgentRtState) -> (String, tokio::task::JoinHandle<()>) {
+async fn serve_shed(state: ShedState) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind gRPC test server");
@@ -324,7 +323,7 @@ async fn serve_agent_rt(state: AgentRtState) -> (String, tokio::task::JoinHandle
     (format!("http://{address}"), server)
 }
 
-fn test_config(inference_url: String, agent_rt_url: String) -> Config {
+fn test_config(inference_url: String, shed_url: String) -> Config {
     Config {
         llm_api_base: inference_url,
         openai_api_key: None,
@@ -335,13 +334,12 @@ fn test_config(inference_url: String, agent_rt_url: String) -> Config {
         postgres: PostgresConfig::default(),
         sqlite: SqliteConfig::default(),
         tools: ToolRuntimeConfig {
-            agent_rt: Some(AgentRtExecutorConfig {
-                endpoint: agent_rt_url,
-                workspace_class_id: "python.default".to_owned(),
-                route_id: "sandbox.python.default".to_owned(),
+            shed: Some(ShedExecutorConfig {
+                endpoint: shed_url,
+                profile_id: "python.default".to_owned(),
                 subject_signing_key: SubjectSigningKey::new("0123456789abcdef0123456789abcdef".to_owned()),
                 subject_issuer: "agentic-api".to_owned(),
-                subject_audience: "agent-rt".to_owned(),
+                subject_audience: "shed".to_owned(),
                 tenant_id: "tenant-a".to_owned(),
                 default_principal_id: "principal-a".to_owned(),
                 execution_timeout: Duration::from_secs(2),
@@ -355,7 +353,7 @@ fn test_config(inference_url: String, agent_rt_url: String) -> Config {
 }
 
 #[tokio::test]
-async fn shell_reuses_referenced_agent_rt_workspace_and_projects_native_outputs() {
+async fn shell_reuses_referenced_shed_workspace_and_projects_native_outputs() {
     let inference_state = InferenceState::default();
     let (inference_url, inference_server) = serve_http(
         axum::Router::new()
@@ -363,10 +361,10 @@ async fn shell_reuses_referenced_agent_rt_workspace_and_projects_native_outputs(
             .with_state(inference_state.clone()),
     )
     .await;
-    let agent_rt_state = AgentRtState::default();
-    let (agent_rt_url, agent_rt_server) = serve_agent_rt(agent_rt_state.clone()).await;
+    let shed_state = ShedState::default();
+    let (shed_url, shed_server) = serve_shed(shed_state.clone()).await;
     let exec_ctx = Arc::new(
-        ExecutionContext::from_config(&test_config(inference_url, agent_rt_url))
+        ExecutionContext::from_config(&test_config(inference_url, shed_url))
             .await
             .expect("execution context"),
     );
@@ -403,7 +401,7 @@ async fn shell_reuses_referenced_agent_rt_workspace_and_projects_native_outputs(
     assert_eq!(call.action.commands, ["printf first", "printf second"]);
     assert_eq!(call.status, ShellCallStatus::Completed);
     let Some(ShellCallEnvironment::ContainerReference { container_id }) = &call.environment else {
-        panic!("shell must project the referenced agent-rt workspace");
+        panic!("shell must project the referenced shed workspace");
     };
     assert_eq!(container_id, "cntr_existing");
     assert_eq!(output.call_id, "call_shell_1");
@@ -429,15 +427,10 @@ async fn shell_reuses_referenced_agent_rt_workspace_and_projects_native_outputs(
     assert!(!reinjected.contains("shell_call_output"));
     assert!(!reinjected.contains("previous_response_id"));
 
-    let workspace_requests = agent_rt_state.workspace_requests.lock().await;
+    let workspace_requests = shed_state.workspace_requests.lock().await;
     assert!(workspace_requests.is_empty());
-    let execution_requests = agent_rt_state.execution_requests.lock().await;
+    let execution_requests = shed_state.execution_requests.lock().await;
     assert_eq!(execution_requests.len(), 2);
-    assert!(
-        execution_requests
-            .iter()
-            .all(|request| request.route_id == "sandbox.python.default")
-    );
     assert_eq!(execution_requests[0].workspace_id, execution_requests[1].workspace_id);
     assert_eq!(execution_requests[0].workspace_id, "cntr_existing");
     assert_ne!(execution_requests[0].execution_id, execution_requests[1].execution_id);
@@ -460,11 +453,11 @@ async fn shell_reuses_referenced_agent_rt_workspace_and_projects_native_outputs(
     assert_eq!(ledger_state, "completed");
 
     inference_server.abort();
-    agent_rt_server.abort();
+    shed_server.abort();
 }
 
 #[tokio::test]
-async fn local_shell_round_trips_through_the_client_without_agent_rt_dispatch() {
+async fn local_shell_round_trips_through_the_client_without_shed_dispatch() {
     let inference_state = InferenceState::default();
     let (inference_url, inference_server) = serve_http(
         axum::Router::new()
@@ -473,7 +466,7 @@ async fn local_shell_round_trips_through_the_client_without_agent_rt_dispatch() 
     )
     .await;
     let mut config = test_config(inference_url, "http://127.0.0.1:1".to_owned());
-    config.tools.agent_rt = None;
+    config.tools.shed = None;
     let exec_ctx = Arc::new(ExecutionContext::from_config(&config).await.expect("execution context"));
     let first_request = serde_json::from_value(serde_json::json!({
         "model": "test-model",
@@ -539,10 +532,10 @@ async fn local_shell_round_trips_through_the_client_without_agent_rt_dispatch() 
 }
 
 #[tokio::test]
-async fn containers_catalog_maps_lifecycle_and_files_to_agent_rt() {
-    let agent_rt_state = AgentRtState::default();
-    let (agent_rt_url, agent_rt_server) = serve_agent_rt(agent_rt_state.clone()).await;
-    let exec_ctx = ExecutionContext::from_config(&test_config("http://127.0.0.1:1".to_owned(), agent_rt_url))
+async fn containers_catalog_maps_lifecycle_and_files_to_shed() {
+    let shed_state = ShedState::default();
+    let (shed_url, shed_server) = serve_shed(shed_state.clone()).await;
+    let exec_ctx = ExecutionContext::from_config(&test_config("http://127.0.0.1:1".to_owned(), shed_url))
         .await
         .expect("execution context");
     let service = exec_ctx.container_service().expect("container service");
@@ -579,7 +572,7 @@ async fn containers_catalog_maps_lifecycle_and_files_to_agent_rt() {
     assert!(file.path.ends_with("-results_.txt"));
     assert_eq!(file.bytes, u64::try_from(expected.len()).expect("test size fits u64"));
 
-    let writes = agent_rt_state.file_write_requests.lock().await;
+    let writes = shed_state.file_write_requests.lock().await;
     assert_eq!(writes.len(), 2);
     assert_eq!(writes[0].offset, 0);
     assert!(writes[0].truncate);
@@ -642,5 +635,5 @@ async fn containers_catalog_maps_lifecycle_and_files_to_agent_rt() {
         .expect("list containers after deletion");
     assert!(containers.data.is_empty());
 
-    agent_rt_server.abort();
+    shed_server.abort();
 }

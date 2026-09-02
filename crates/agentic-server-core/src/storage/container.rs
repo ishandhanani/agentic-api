@@ -7,7 +7,7 @@ use crate::tool::AuthenticatedSubject;
 pub(crate) struct ContainerRecord {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) workspace_class_id: String,
+    pub(crate) profile_id: String,
     pub(crate) memory_limit: String,
     pub(crate) status: String,
     pub(crate) expires_after_minutes: Option<u64>,
@@ -20,7 +20,7 @@ pub(crate) struct ClaimContainer<'a> {
     pub(crate) subject: &'a AuthenticatedSubject,
     pub(crate) id: &'a str,
     pub(crate) name: &'a str,
-    pub(crate) workspace_class_id: &'a str,
+    pub(crate) profile_id: &'a str,
     pub(crate) memory_limit: &'a str,
     pub(crate) created_at_millis: u64,
 }
@@ -52,7 +52,7 @@ impl ContainerStore {
         let created_at = millis_to_i64(claim.created_at_millis)?;
         sqlx::query(
             "INSERT INTO containers (
-                 tenant_id, principal_id, id, name, workspace_class_id, memory_limit, status,
+                 tenant_id, principal_id, id, name, profile_id, memory_limit, status,
                  created_at, last_active_at
              ) VALUES ($1, $2, $3, $4, $5, $6, 'creating', $7, $7)",
         )
@@ -60,7 +60,7 @@ impl ContainerStore {
         .bind(&claim.subject.principal_id)
         .bind(claim.id)
         .bind(claim.name)
-        .bind(claim.workspace_class_id)
+        .bind(claim.profile_id)
         .bind(claim.memory_limit)
         .bind(created_at)
         .execute(self.pool.as_ref())
@@ -102,7 +102,7 @@ impl ContainerStore {
 
     pub(crate) async fn get(&self, subject: &AuthenticatedSubject, id: &str) -> Result<ContainerRecord, StorageError> {
         sqlx::query_as::<_, ContainerRow>(
-            "SELECT id, name, workspace_class_id, memory_limit, status, expires_after_minutes,
+            "SELECT id, name, profile_id, memory_limit, status, expires_after_minutes,
                     created_at, last_active_at, expires_at
              FROM containers
              WHERE tenant_id = $1 AND principal_id = $2 AND id = $3 AND deleted_at IS NULL",
@@ -215,16 +215,16 @@ impl ContainerStore {
     }
 }
 
-const LIST_ASC: &str = "SELECT id, name, workspace_class_id, memory_limit, status, expires_after_minutes, created_at, last_active_at, expires_at FROM containers WHERE tenant_id = $1 AND principal_id = $2 AND deleted_at IS NULL AND ($3 OR created_at > $4 OR (created_at = $4 AND id > $5)) ORDER BY created_at ASC, id ASC LIMIT $6";
-const LIST_DESC: &str = "SELECT id, name, workspace_class_id, memory_limit, status, expires_after_minutes, created_at, last_active_at, expires_at FROM containers WHERE tenant_id = $1 AND principal_id = $2 AND deleted_at IS NULL AND ($3 OR created_at < $4 OR (created_at = $4 AND id < $5)) ORDER BY created_at DESC, id DESC LIMIT $6";
-const LIST_ASC_WITH_NAME: &str = "SELECT id, name, workspace_class_id, memory_limit, status, expires_after_minutes, created_at, last_active_at, expires_at FROM containers WHERE tenant_id = $1 AND principal_id = $2 AND deleted_at IS NULL AND ($3 OR created_at > $4 OR (created_at = $4 AND id > $5)) AND name = $6 ORDER BY created_at ASC, id ASC LIMIT $7";
-const LIST_DESC_WITH_NAME: &str = "SELECT id, name, workspace_class_id, memory_limit, status, expires_after_minutes, created_at, last_active_at, expires_at FROM containers WHERE tenant_id = $1 AND principal_id = $2 AND deleted_at IS NULL AND ($3 OR created_at < $4 OR (created_at = $4 AND id < $5)) AND name = $6 ORDER BY created_at DESC, id DESC LIMIT $7";
+const LIST_ASC: &str = "SELECT id, name, profile_id, memory_limit, status, expires_after_minutes, created_at, last_active_at, expires_at FROM containers WHERE tenant_id = $1 AND principal_id = $2 AND deleted_at IS NULL AND ($3 OR created_at > $4 OR (created_at = $4 AND id > $5)) ORDER BY created_at ASC, id ASC LIMIT $6";
+const LIST_DESC: &str = "SELECT id, name, profile_id, memory_limit, status, expires_after_minutes, created_at, last_active_at, expires_at FROM containers WHERE tenant_id = $1 AND principal_id = $2 AND deleted_at IS NULL AND ($3 OR created_at < $4 OR (created_at = $4 AND id < $5)) ORDER BY created_at DESC, id DESC LIMIT $6";
+const LIST_ASC_WITH_NAME: &str = "SELECT id, name, profile_id, memory_limit, status, expires_after_minutes, created_at, last_active_at, expires_at FROM containers WHERE tenant_id = $1 AND principal_id = $2 AND deleted_at IS NULL AND ($3 OR created_at > $4 OR (created_at = $4 AND id > $5)) AND name = $6 ORDER BY created_at ASC, id ASC LIMIT $7";
+const LIST_DESC_WITH_NAME: &str = "SELECT id, name, profile_id, memory_limit, status, expires_after_minutes, created_at, last_active_at, expires_at FROM containers WHERE tenant_id = $1 AND principal_id = $2 AND deleted_at IS NULL AND ($3 OR created_at < $4 OR (created_at = $4 AND id < $5)) AND name = $6 ORDER BY created_at DESC, id DESC LIMIT $7";
 
 #[derive(sqlx::FromRow)]
 struct ContainerRow {
     id: String,
     name: String,
-    workspace_class_id: String,
+    profile_id: String,
     memory_limit: String,
     status: String,
     expires_after_minutes: Option<i64>,
@@ -240,7 +240,7 @@ impl TryFrom<ContainerRow> for ContainerRecord {
         Ok(Self {
             id: row.id,
             name: row.name,
-            workspace_class_id: row.workspace_class_id,
+            profile_id: row.profile_id,
             memory_limit: row.memory_limit,
             status: row.status,
             expires_after_minutes: row.expires_after_minutes.map(i64_to_u64).transpose()?,

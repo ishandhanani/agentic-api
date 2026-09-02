@@ -64,6 +64,8 @@ pub struct UpstreamRequest<'a> {
     pub model: &'a str,
     pub input: Cow<'a, ResponsesInput>,
     pub stream: bool,
+    /// Agentic API owns response persistence and continuation state.
+    pub store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<&'a str>,
     /// Tools forwarded to vLLM. Function-like declarations are normalized to
@@ -174,6 +176,7 @@ impl RequestPayload {
             model: &self.model,
             input: self.input.model_input(),
             stream,
+            store: false,
             instructions: self.instructions.as_deref(),
             tools,
             tool_choice: Some(tool_choice),
@@ -380,6 +383,21 @@ mod tests {
             .expect("upstream request should serialize");
 
         assert_eq!(upstream["cache_salt"], "tenant-a");
+    }
+
+    #[test]
+    fn upstream_requests_disable_provider_storage() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "store": true
+        }))
+        .expect("request should deserialize");
+
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+
+        assert_eq!(upstream["store"], false);
     }
 
     #[test]

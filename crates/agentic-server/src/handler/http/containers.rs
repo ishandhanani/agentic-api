@@ -239,7 +239,7 @@ fn service_and_subject<'a>(
     let service = state
         .exec_ctx
         .container_service()
-        .ok_or_else(|| "containers require an AGENT_RT_ENDPOINT configuration".to_owned())?;
+        .ok_or_else(|| "containers require an SHED_ENDPOINT configuration".to_owned())?;
     let subject = state
         .exec_ctx
         .remote_execution_subject(principal.map(AuthenticatedPrincipal::subject))

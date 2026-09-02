@@ -2,7 +2,7 @@
 
 syntax = "proto3";
 
-package agent_rt.control;
+package shed.control;
 
 service WorkspaceService {
   rpc CreateWorkspace(CreateWorkspaceRequest) returns (Workspace);
@@ -31,7 +31,7 @@ service ArtifactService {
 }
 
 // Advisory demand ingestion for the independent capacity planner. Reports are
-// authenticated and resolve operator-owned routes; provider and pool identity
+// authenticated and resolve operator-owned profiles; provider and pool identity
 // never appear in this caller-facing contract.
 service CapacityService {
   rpc ReportCapacityIntent(ReportCapacityIntentRequest) returns (CapacityIntent);
@@ -39,7 +39,7 @@ service CapacityService {
 
 message CreateWorkspaceRequest {
   string workspace_id = 1;
-  string workspace_class_id = 2;
+  string profile_id = 2;
 }
 
 message GetWorkspaceRequest {
@@ -52,8 +52,8 @@ message DeleteWorkspaceRequest {
 
 message Workspace {
   string workspace_id = 1;
-  string workspace_class_id = 2;
-  string workspace_class_revision = 3;
+  string profile_id = 2;
+  string profile_revision = 3;
   WorkspaceState state = 4;
   uint64 revision = 5;
   uint64 created_at_unix_millis = 6;
@@ -81,11 +81,10 @@ enum WorkspaceState {
 message StartExecutionRequest {
   string execution_id = 1;
   string workspace_id = 2;
-  string route_id = 3;
-  Command command = 4;
-  uint64 absolute_deadline_unix_millis = 5;
-  ExecutionLimits limits = 6;
-  map<string, string> client_metadata = 7;
+  Command command = 3;
+  uint64 absolute_deadline_unix_millis = 4;
+  ExecutionLimits limits = 5;
+  map<string, string> client_metadata = 6;
 }
 
 message Command {
@@ -94,8 +93,8 @@ message Command {
   map<string, string> env = 3;
   bytes stdin = 4;
   repeated string artifact_paths = 5;
-  // Logical workspace user selected from the operator-owned workspace class.
-  // When absent, the class/provider default is used.
+  // Logical workspace user selected from the operator-owned profile.
+  // When absent, the profile/provider default is used.
   optional string user = 6;
 }
 
@@ -120,14 +119,13 @@ message WatchExecutionRequest {
 message Execution {
   string execution_id = 1;
   string workspace_id = 2;
-  string route_id = 3;
-  uint64 revision = 4;
-  ExecutionState state = 5;
-  optional ExecutionResult result = 6;
-  optional string failure_code = 7;
-  repeated ArtifactMetadata artifacts = 8;
-  uint64 accepted_at_unix_millis = 9;
-  optional uint64 completed_at_unix_millis = 10;
+  uint64 revision = 3;
+  ExecutionState state = 4;
+  optional ExecutionResult result = 5;
+  optional string failure_code = 6;
+  repeated ArtifactMetadata artifacts = 7;
+  uint64 accepted_at_unix_millis = 8;
+  optional uint64 completed_at_unix_millis = 9;
 }
 
 enum ExecutionState {
@@ -228,7 +226,7 @@ message ArtifactChunk {
 
 message ReportCapacityIntentRequest {
   string source_id = 1;
-  string route_id = 2;
+  string profile_id = 2;
   uint64 slots = 3;
   uint32 confidence_per_million = 4;
   uint64 ready_by_unix_millis = 5;
@@ -238,7 +236,7 @@ message ReportCapacityIntentRequest {
 
 message CapacityIntent {
   string source_id = 1;
-  string route_id = 2;
+  string profile_id = 2;
   uint64 slots = 3;
   uint32 confidence_per_million = 4;
   uint64 ready_by_unix_millis = 5;
