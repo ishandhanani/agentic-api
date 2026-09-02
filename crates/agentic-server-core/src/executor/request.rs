@@ -10,7 +10,7 @@ use crate::storage::{
     ConversationStore, ConversationVersion, DatabaseBackend, ResponseStore, create_pool_with_schema_and_configs,
 };
 use crate::tool::AuthenticatedSubject;
-use crate::tool::{GatewayExecutorRegistration, GatewayExecutors, RemoteAgentRtExecutor};
+use crate::tool::{GatewayExecutorRegistration, GatewayExecutors, RemoteAgentRtExecutor, RemoteAgentRtShellExecutor};
 use crate::types::io::InputItem;
 use crate::types::messages::GatewayToolMap;
 use crate::types::request_response::{RequestPayload, ResponsePayload};
@@ -184,7 +184,8 @@ impl ExecutionContext {
             let executor =
                 RemoteAgentRtExecutor::new(agent_rt, crate::storage::RemoteExecutionLedger::new(pool.clone()))
                     .map_err(|error| Error::Config(format!("failed to configure agent-rt executor: {error}")))?;
-            gateway_executors.register(Arc::new(executor));
+            gateway_executors.register(Arc::new(executor.clone()));
+            gateway_executors.register(Arc::new(RemoteAgentRtShellExecutor::new(executor)));
         }
         Ok(Self {
             conv_handler,

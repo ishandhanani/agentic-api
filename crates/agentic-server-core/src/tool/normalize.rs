@@ -9,6 +9,7 @@ use super::function::FunctionHandler;
 use super::handler::{ToolError, ToolHandler, ToolOutput};
 use super::mcp::McpHandler;
 use super::registry::ToolType;
+use super::shell::shell_function_tool;
 use super::web_search::web_search_function_tool;
 
 impl ResponsesTool {
@@ -22,7 +23,9 @@ impl ResponsesTool {
         match self {
             Self::Function(param) => FunctionHandler.validate(param),
             Self::Mcp(param) => McpHandler::spec_from_param(param).validate(param),
-            Self::WebSearch(_) | Self::FileSearch(_) | Self::CodeInterpreter(_) | Self::Unknown => Ok(()),
+            Self::WebSearch(_) | Self::FileSearch(_) | Self::CodeInterpreter(_) | Self::Shell(_) | Self::Unknown => {
+                Ok(())
+            }
             Self::Namespace(param) => CodexNamespaceHandler.validate(param),
             Self::Custom(param) => CustomHandler.validate(param),
         }
@@ -37,6 +40,7 @@ impl ResponsesTool {
             Self::WebSearch(_) => Some(ToolType::WebSearch),
             Self::FileSearch(_) => Some(ToolType::FileSearch),
             Self::CodeInterpreter(_) => Some(ToolType::CodeInterpreter),
+            Self::Shell(_) => Some(ToolType::Shell),
             Self::Namespace(_) => Some(ToolType::CodexNamespace),
             Self::Custom(_) => Some(ToolType::Custom),
             Self::Unknown => None,
@@ -75,6 +79,7 @@ impl ResponsesTool {
                 vec![]
             }
             Self::CodeInterpreter(_) => vec![code_interpreter_function_tool()],
+            Self::Shell(_) => vec![shell_function_tool()],
             Self::Namespace(param) => CodexNamespaceHandler.normalize(param),
             Self::Custom(param) => CustomHandler.normalize(param),
             Self::Unknown => {

@@ -66,18 +66,25 @@ impl GatewayExecutionContext {
 /// remains responsible for output indexes, SSE framing, and event ordering.
 #[derive(Debug, Clone, Default)]
 pub struct GatewayToolEventPlan {
-    started_output: Option<OutputItem>,
+    started_outputs: Vec<Option<OutputItem>>,
 }
 
 impl GatewayToolEventPlan {
     #[must_use]
-    pub const fn new(started_output: Option<OutputItem>) -> Self {
-        Self { started_output }
+    pub fn one(started_output: Option<OutputItem>) -> Self {
+        Self {
+            started_outputs: vec![started_output],
+        }
     }
 
     #[must_use]
-    pub(crate) fn into_started_output(self) -> Option<OutputItem> {
-        self.started_output
+    pub fn with_slots(started_outputs: Vec<Option<OutputItem>>) -> Self {
+        Self { started_outputs }
+    }
+
+    #[must_use]
+    pub(crate) fn into_started_outputs(self) -> Vec<Option<OutputItem>> {
+        self.started_outputs
     }
 }
 
@@ -120,11 +127,9 @@ pub trait ToolHandler: Send + Sync {
 
 /// Extension of [`ToolHandler`] for tool types that are executed by the gateway.
 ///
-/// Only executable gateway handlers implement this trait. MCP and web search
-/// implement it today. File search and code interpreter are gateway-owned in
-/// the registry but do not yet have executors. Client-owned tools (`Function`,
-/// `Custom`, `CodexNamespace`) do not implement it, so they cannot be dispatched
-/// through this interface.
+/// Only executable gateway handlers implement this trait. Client-owned tools
+/// (`Function`, `Custom`, `CodexNamespace`) do not implement it, so they cannot
+/// be dispatched through this interface.
 ///
 /// ## Note on `async fn` in traits
 ///
@@ -196,7 +201,7 @@ pub trait GatewayExecutor: ToolHandler + 'static {
     /// gateway-specific call item.
     #[must_use]
     fn plan_gateway_events(&self, call: &FunctionToolCall, params: &Self::ExecutionParams) -> GatewayToolEventPlan {
-        GatewayToolEventPlan::new(self.started_output(call, params))
+        GatewayToolEventPlan::one(self.started_output(call, params))
     }
 
     /// The placeholder output item shown while this call is in progress.
@@ -210,18 +215,18 @@ pub trait GatewayExecutor: ToolHandler + 'static {
         None
     }
 
-    /// The public output item for a completed or failed call.
-    /// Defaults to `None` (no gateway-specific shape).
+    /// The public output items for a completed or failed call.
+    /// Defaults to an empty projection.
     #[must_use]
-    fn public_output(
+    fn public_outputs(
         &self,
         call: &FunctionToolCall,
         output: &ToolOutput,
         status: GatewayCallStatus,
         params: &Self::ExecutionParams,
-    ) -> Option<OutputItem> {
+    ) -> Vec<OutputItem> {
         let _ = (call, output, status, params);
-        None
+        Vec::new()
     }
 }
 

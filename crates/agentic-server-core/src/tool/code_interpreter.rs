@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_rt_control::execution_service_client::ExecutionServiceClient;
@@ -13,6 +14,7 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
@@ -31,6 +33,13 @@ pub struct RemoteAgentRtExecutor {
     channel: Channel,
     config: AgentRtExecutorConfig,
     ledger: RemoteExecutionLedger,
+    workspace_locks: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
+}
+
+pub(crate) struct RemoteCommand {
+    pub command: Command,
+    pub timeout: Option<Duration>,
+    pub max_output_bytes: Option<u64>,
 }
 
 impl std::fmt::Debug for RemoteAgentRtExecutor {
@@ -72,36 +81,11 @@ impl RemoteAgentRtExecutor {
             channel: endpoint.connect_lazy(),
             config,
             ledger,
+            workspace_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     async fn execute_remote(&self, context: GatewayExecutionContext, arguments: &str) -> Result<ToolOutput, ToolError> {
-        let (link, request, token) = self.prepare_execution(&context, arguments).await?;
-        self.create_workspace(&link, &token, context.trace_context.traceparent.as_deref())
-            .await
-            .map_err(remote_error)?;
-        let mut cancel_on_drop = RemoteCancelOnDrop::new(
-            self.channel.clone(),
-            self.config.transport_timeout,
-            link.execution_id.clone(),
-            token.clone(),
-        );
-        let record = self
-            .start_or_recover(&link, request, &token, context.trace_context.traceparent.as_deref())
-            .await?;
-        let outcome = self.await_terminal(&context, &link, &token, record).await;
-        cancel_on_drop.disarm();
-        outcome
-    }
-
-    async fn prepare_execution(
-        &self,
-        context: &GatewayExecutionContext,
-        arguments: &str,
-    ) -> Result<(RemoteExecutionLink, StartExecutionRequest, String), ToolError> {
-        let subject = context.subject.as_ref().ok_or_else(|| {
-            ToolError::Config("agent-rt execution requires an authenticated tenant and principal".to_owned())
-        })?;
         let args: CodeInterpreterArguments = serde_json::from_str(arguments)
             .map_err(|error| ToolError::Config(format!("invalid code_interpreter arguments: {error}")))?;
         if args.code.trim().is_empty() {
@@ -109,14 +93,45 @@ impl RemoteAgentRtExecutor {
                 "code_interpreter requires a non-empty code string".to_owned(),
             ));
         }
+        self.execute_commands(
+            context,
+            vec![RemoteCommand {
+                command: Command {
+                    argv: vec!["python".to_owned(), "-c".to_owned(), args.code],
+                    cwd: None,
+                    env: HashMap::new(),
+                    stdin: Vec::new(),
+                    artifact_paths: Vec::new(),
+                },
+                timeout: None,
+                max_output_bytes: None,
+            }],
+        )
+        .await
+    }
 
-        let request_fingerprint = request_fingerprint(&self.config.route_id, &context.workspace_id, &args.code);
+    pub(crate) async fn execute_commands(
+        &self,
+        context: GatewayExecutionContext,
+        commands: Vec<RemoteCommand>,
+    ) -> Result<ToolOutput, ToolError> {
+        if commands.is_empty() {
+            return Err(ToolError::Config("agent-rt requires at least one command".to_owned()));
+        }
+        let subject = context.subject.as_ref().ok_or_else(|| {
+            ToolError::Config("agent-rt execution requires an authenticated tenant and principal".to_owned())
+        })?;
+        let _workspace_permit = self.workspace_permit(&context.workspace_id).await?;
+
+        let request_fingerprint = request_fingerprint(&self.config.route_id, &context.workspace_id, &commands);
         let proposed_deadline = context
             .absolute_deadline
             .unwrap_or_else(|| SystemTime::now() + self.config.execution_timeout)
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| ToolError::Config("execution deadline precedes the Unix epoch".to_owned()))?
-            .as_secs();
+            .map_err(|_| ToolError::Config("execution deadline precedes the Unix epoch".to_owned()))?;
+        let proposed_deadline = proposed_deadline
+            .as_secs()
+            .saturating_add(u64::from(proposed_deadline.subsec_nanos() != 0));
         let proposed_deadline = i64::try_from(proposed_deadline)
             .map_err(|_| ToolError::Config("execution deadline exceeds supported range".to_owned()))?;
         let link = self
@@ -137,26 +152,78 @@ impl RemoteAgentRtExecutor {
                 "remote execution identity does not match the durable logical-call binding".to_owned(),
             ));
         }
+        let token = self.sign_subject(&link)?;
+        self.create_workspace(&link, &token, context.trace_context.traceparent.as_deref())
+            .await
+            .map_err(remote_error)?;
 
-        let absolute_deadline_unix_millis = u64::try_from(link.absolute_deadline)
+        let command_count = commands.len();
+        let mut outcomes = Vec::with_capacity(command_count);
+        let mut cancelled = false;
+        for (command_index, command) in commands.into_iter().enumerate() {
+            if context.cancellation.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            let record = self
+                .execute_command(&context, &link, &token, command_index, command_count, command)
+                .await?;
+            cancelled = context.cancellation.is_cancelled() || record.state == ExecutionOutcomeState::Cancelled;
+            outcomes.push(record);
+            if cancelled {
+                break;
+            }
+        }
+
+        let outcome = serde_json::to_string(&outcomes)
+            .map_err(|error| ToolError::Execution(format!("failed to serialize agent-rt outcome: {error}")))?;
+        self.ledger
+            .record_outcome(&link, if cancelled { "cancelled" } else { "completed" }, &outcome)
+            .await
+            .map_err(|error| ToolError::Execution(format!("failed to persist remote execution outcome: {error}")))?;
+        Ok(ToolOutput {
+            call_id: context.call_id,
+            output: outcome,
+        })
+    }
+
+    async fn execute_command(
+        &self,
+        context: &GatewayExecutionContext,
+        link: &RemoteExecutionLink,
+        token: &str,
+        command_index: usize,
+        command_count: usize,
+        command: RemoteCommand,
+    ) -> Result<ExecutionOutcome, ToolError> {
+        let execution_id = if command_count == 1 {
+            link.execution_id.clone()
+        } else {
+            child_execution_id(&link.execution_id, command_index)
+        };
+        let root_deadline_millis = u64::try_from(link.absolute_deadline)
             .unwrap_or_default()
             .saturating_mul(1_000);
+        let command_deadline_millis = command
+            .timeout
+            .and_then(|timeout| SystemTime::now().checked_add(timeout))
+            .and_then(|deadline| deadline.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .map_or(root_deadline_millis, |deadline| deadline.min(root_deadline_millis));
         let request = StartExecutionRequest {
-            execution_id: link.execution_id.clone(),
+            execution_id: execution_id.clone(),
             workspace_id: link.workspace_id.clone(),
             route_id: link.route_id.clone(),
-            command: Some(Command {
-                argv: vec!["python".to_owned(), "-c".to_owned(), args.code],
-                cwd: None,
-                env: HashMap::new(),
-                stdin: Vec::new(),
-                artifact_paths: Vec::new(),
+            command: Some(command.command),
+            absolute_deadline_unix_millis: command_deadline_millis,
+            limits: Some(ExecutionLimits {
+                max_output_bytes: command.max_output_bytes,
+                max_artifact_bytes: None,
             }),
-            absolute_deadline_unix_millis,
-            limits: Some(ExecutionLimits::default()),
             client_metadata: [
                 ("response_id".to_owned(), link.response_id.clone()),
                 ("call_id".to_owned(), link.call_id.clone()),
+                ("command_index".to_owned(), command_index.to_string()),
             ]
             .into_iter()
             .chain(
@@ -166,8 +233,42 @@ impl RemoteAgentRtExecutor {
             )
             .collect(),
         };
-        let token = self.sign_subject(&link)?;
-        Ok((link, request, token))
+        let mut cancel_on_drop = RemoteCancelOnDrop::new(
+            self.channel.clone(),
+            self.config.transport_timeout,
+            execution_id.clone(),
+            token.to_owned(),
+        );
+        let record = self
+            .start_or_recover(
+                link,
+                &execution_id,
+                request,
+                token,
+                context.trace_context.traceparent.as_deref(),
+            )
+            .await?;
+        let outcome = self
+            .await_terminal(context, link, &execution_id, command_deadline_millis, token, record)
+            .await?;
+        cancel_on_drop.disarm();
+        Ok(outcome)
+    }
+
+    async fn workspace_permit(&self, workspace_id: &str) -> Result<OwnedSemaphorePermit, ToolError> {
+        let semaphore = {
+            let mut locks = self.workspace_locks.lock().await;
+            locks.retain(|_, semaphore| semaphore.strong_count() > 0);
+            locks.get(workspace_id).and_then(Weak::upgrade).unwrap_or_else(|| {
+                let semaphore = Arc::new(Semaphore::new(1));
+                locks.insert(workspace_id.to_owned(), Arc::downgrade(&semaphore));
+                semaphore
+            })
+        };
+        semaphore
+            .acquire_owned()
+            .await
+            .map_err(|_| ToolError::Execution("agent-rt workspace serializer closed unexpectedly".to_owned()))
     }
 
     async fn create_workspace(
@@ -209,13 +310,14 @@ impl RemoteAgentRtExecutor {
     async fn start_or_recover(
         &self,
         link: &RemoteExecutionLink,
+        execution_id: &str,
         request: StartExecutionRequest,
         token: &str,
         traceparent: Option<&str>,
     ) -> Result<ExecutionOutcome, ToolError> {
         let record = match self.start(request.clone(), token, traceparent).await {
             Ok(record) => record,
-            Err(RemoteTransportError::Ambiguous(_)) => match self.lookup(link, token).await {
+            Err(RemoteTransportError::Ambiguous(_)) => match self.lookup(execution_id, token).await {
                 Ok(record) => record,
                 Err(RemoteTransportError::NotFound) => match self.start(request, token, traceparent).await {
                     Ok(record) => record,
@@ -242,23 +344,29 @@ impl RemoteAgentRtExecutor {
         &self,
         context: &GatewayExecutionContext,
         link: &RemoteExecutionLink,
+        execution_id: &str,
+        deadline_unix_millis: u64,
         token: &str,
         mut record: ExecutionOutcome,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<ExecutionOutcome, ToolError> {
         loop {
             if record.state.is_terminal() {
-                return self.finish(&context.call_id, link, record).await;
+                return Ok(record);
             }
             if context.cancellation.is_cancelled() {
                 record = self
-                    .cancel(link, token)
+                    .cancel(execution_id, token)
                     .await
                     .and_then(ExecutionOutcome::try_from)
                     .map_err(remote_error)?;
-                return self.finish(&context.call_id, link, record).await;
+                return Ok(record);
             }
-            if unix_seconds_i64() >= link.absolute_deadline {
-                record = match self.lookup(link, token).await.and_then(ExecutionOutcome::try_from) {
+            if unix_millis_u64() >= deadline_unix_millis {
+                record = match self
+                    .lookup(execution_id, token)
+                    .await
+                    .and_then(ExecutionOutcome::try_from)
+                {
                     Ok(record) => record,
                     Err(_) => {
                         return self
@@ -267,7 +375,7 @@ impl RemoteAgentRtExecutor {
                     }
                 };
                 if record.state.is_terminal() {
-                    return self.finish(&context.call_id, link, record).await;
+                    return Ok(record);
                 }
                 return self
                     .finish_unknown(
@@ -279,7 +387,7 @@ impl RemoteAgentRtExecutor {
 
             record = tokio::select! {
                 () = context.cancellation.cancelled() => continue,
-                result = self.watch_once(link, token, record.revision) => {
+                result = self.watch_once(execution_id, token, record.revision) => {
                     match result.and_then(ExecutionOutcome::try_from) {
                         Ok(record) => record,
                         Err(RemoteTransportError::Ambiguous(_)) => {
@@ -295,37 +403,6 @@ impl RemoteAgentRtExecutor {
                 }
             };
         }
-    }
-
-    async fn finish(
-        &self,
-        call_id: &str,
-        link: &RemoteExecutionLink,
-        record: ExecutionOutcome,
-    ) -> Result<ToolOutput, ToolError> {
-        let outcome = serde_json::to_string(&record)
-            .map_err(|error| ToolError::Execution(format!("failed to serialize agent-rt outcome: {error}")))?;
-        self.ledger
-            .record_outcome(link, record.state.as_str(), &outcome)
-            .await
-            .map_err(|error| ToolError::Execution(format!("failed to persist remote execution outcome: {error}")))?;
-        if record.state == ExecutionOutcomeState::OutcomeUnknown {
-            return Err(ToolError::OutcomeUnknown {
-                execution_id: link.execution_id.clone(),
-                message: "agent-rt cannot determine the provider outcome".to_owned(),
-            });
-        }
-        if record.state != ExecutionOutcomeState::Completed {
-            return Err(ToolError::Execution(format!(
-                "agent-rt execution {} ended in state {}",
-                link.execution_id,
-                record.state.as_str()
-            )));
-        }
-        Ok(ToolOutput {
-            call_id: call_id.to_owned(),
-            output: outcome,
-        })
     }
 
     async fn finish_unknown<T>(&self, link: &RemoteExecutionLink, message: &str) -> Result<T, ToolError> {
@@ -357,10 +434,10 @@ impl RemoteAgentRtExecutor {
             .map_err(|status| classify_status(&status))
     }
 
-    async fn lookup(&self, link: &RemoteExecutionLink, token: &str) -> Result<Execution, RemoteTransportError> {
+    async fn lookup(&self, execution_id: &str, token: &str) -> Result<Execution, RemoteTransportError> {
         let request = grpc_request(
             GetExecutionRequest {
-                execution_id: link.execution_id.clone(),
+                execution_id: execution_id.to_owned(),
             },
             token,
             self.config.transport_timeout,
@@ -375,13 +452,13 @@ impl RemoteAgentRtExecutor {
 
     async fn watch_once(
         &self,
-        link: &RemoteExecutionLink,
+        execution_id: &str,
         token: &str,
         after_revision: u64,
     ) -> Result<Execution, RemoteTransportError> {
         let request = grpc_request(
             WatchExecutionRequest {
-                execution_id: link.execution_id.clone(),
+                execution_id: execution_id.to_owned(),
                 after_revision,
             },
             token,
@@ -395,7 +472,7 @@ impl RemoteAgentRtExecutor {
             .into_inner();
         match tokio::time::timeout(self.config.lookup_wait, stream.message()).await {
             Ok(Ok(Some(record))) => Ok(record),
-            Ok(Ok(None)) => self.lookup(link, token).await,
+            Ok(Ok(None)) => self.lookup(execution_id, token).await,
             Ok(Err(status)) => Err(classify_status(&status)),
             Err(_) => Err(RemoteTransportError::Ambiguous(
                 "execution watch timed out before a revision".to_owned(),
@@ -403,11 +480,11 @@ impl RemoteAgentRtExecutor {
         }
     }
 
-    async fn cancel(&self, link: &RemoteExecutionLink, token: &str) -> Result<Execution, RemoteTransportError> {
+    async fn cancel(&self, execution_id: &str, token: &str) -> Result<Execution, RemoteTransportError> {
         cancel_execution(
             self.channel.clone(),
             self.config.transport_timeout,
-            link.execution_id.clone(),
+            execution_id.to_owned(),
             token,
         )
         .await
@@ -529,15 +606,22 @@ impl GatewayExecutor for RemoteAgentRtExecutor {
         true
     }
 
-    fn public_output(
+    fn public_outputs(
         &self,
         call: &FunctionToolCall,
         output: &ToolOutput,
         status: GatewayCallStatus,
         _params: &Self::ExecutionParams,
-    ) -> Option<OutputItem> {
-        let arguments: CodeInterpreterArguments = serde_json::from_str(&call.arguments).ok()?;
-        let record: ExecutionOutcome = serde_json::from_str(&output.output).ok()?;
+    ) -> Vec<OutputItem> {
+        let Ok(arguments) = serde_json::from_str::<CodeInterpreterArguments>(&call.arguments) else {
+            return Vec::new();
+        };
+        let Ok(records) = serde_json::from_str::<Vec<ExecutionOutcome>>(&output.output) else {
+            return Vec::new();
+        };
+        let Some(record) = records.into_iter().next() else {
+            return Vec::new();
+        };
         let result = record.result.as_ref();
         let mut logs = result.map_or_else(String::new, |result| result.stdout.clone());
         if let Some(stderr) = result
@@ -549,7 +633,7 @@ impl GatewayExecutor for RemoteAgentRtExecutor {
             }
             logs.push_str(stderr);
         }
-        Some(OutputItem::CodeInterpreterCall(CodeInterpreterCall {
+        vec![OutputItem::CodeInterpreterCall(CodeInterpreterCall {
             id: call.id.clone(),
             code: arguments.code,
             container_id: record.workspace_id,
@@ -565,7 +649,7 @@ impl GatewayExecutor for RemoteAgentRtExecutor {
             } else {
                 CodeInterpreterCallStatus::Failed
             },
-        }))
+        })]
     }
 }
 
@@ -625,14 +709,87 @@ fn grpc_request<T>(
     Ok(request)
 }
 
-fn request_fingerprint(route_id: &str, workspace_id: &str, code: &str) -> String {
+fn request_fingerprint(route_id: &str, workspace_id: &str, commands: &[RemoteCommand]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"agentic-api-agent-rt-request");
-    for component in [route_id, workspace_id, "python", code] {
-        hasher.update(&(component.len() as u64).to_le_bytes());
-        hasher.update(component.as_bytes());
+    hash_bytes(&mut hasher, route_id.as_bytes());
+    hash_bytes(&mut hasher, workspace_id.as_bytes());
+    hash_len(&mut hasher, commands.len());
+    for remote in commands {
+        hash_len(&mut hasher, remote.command.argv.len());
+        for argument in &remote.command.argv {
+            hash_bytes(&mut hasher, argument.as_bytes());
+        }
+        hash_option_bytes(&mut hasher, remote.command.cwd.as_deref().map(str::as_bytes));
+        let mut environment = remote.command.env.iter().collect::<Vec<_>>();
+        environment.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        hash_len(&mut hasher, environment.len());
+        for (name, value) in environment {
+            hash_bytes(&mut hasher, name.as_bytes());
+            hash_bytes(&mut hasher, value.as_bytes());
+        }
+        hash_bytes(&mut hasher, &remote.command.stdin);
+        hash_len(&mut hasher, remote.command.artifact_paths.len());
+        for path in &remote.command.artifact_paths {
+            hash_bytes(&mut hasher, path.as_bytes());
+        }
+        hash_option_u128(&mut hasher, remote.timeout.map(|timeout| timeout.as_nanos()));
+        hash_option_u64(&mut hasher, remote.max_output_bytes);
     }
     format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn hash_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hash_len(hasher: &mut blake3::Hasher, value: usize) {
+    hasher.update(&u64::try_from(value).unwrap_or(u64::MAX).to_le_bytes());
+}
+
+fn hash_option_bytes(hasher: &mut blake3::Hasher, value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hash_bytes(hasher, value);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn hash_option_u64(hasher: &mut blake3::Hasher, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hash_bytes(hasher, &value.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn hash_option_u128(hasher: &mut blake3::Hasher, value: Option<u128>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hash_bytes(hasher, &value.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn child_execution_id(root_execution_id: &str, command_index: usize) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"agentic-api-agent-rt-child-execution");
+    hash_bytes(&mut hasher, root_execution_id.as_bytes());
+    hasher.update(&u64::try_from(command_index).unwrap_or(u64::MAX).to_le_bytes());
+    format!("exec_{}", hasher.finalize().to_hex())
 }
 
 fn classify_status(status: &Status) -> RemoteTransportError {
@@ -672,6 +829,14 @@ fn unix_seconds_i64() -> i64 {
         .unwrap_or_default()
 }
 
+fn unix_millis_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CodeInterpreterArguments {
@@ -691,7 +856,7 @@ struct SubjectClaims {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum ExecutionOutcomeState {
+pub(crate) enum ExecutionOutcomeState {
     Accepted,
     Running,
     Completed,
@@ -702,41 +867,29 @@ enum ExecutionOutcomeState {
 }
 
 impl ExecutionOutcomeState {
-    const fn is_terminal(self) -> bool {
+    pub(crate) const fn is_terminal(self) -> bool {
         !matches!(self, Self::Accepted | Self::Running)
     }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Accepted => "accepted",
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::TimedOut => "timed_out",
-            Self::OutcomeUnknown => "outcome_unknown",
-        }
-    }
 }
 
 #[derive(Deserialize, Serialize)]
-struct ExecutionOutcome {
-    execution_id: String,
-    workspace_id: String,
-    route_id: String,
-    revision: u64,
-    state: ExecutionOutcomeState,
-    result: Option<ExecutionResultProjection>,
-    failure_code: Option<String>,
+pub(crate) struct ExecutionOutcome {
+    pub execution_id: String,
+    pub workspace_id: String,
+    pub route_id: String,
+    pub revision: u64,
+    pub state: ExecutionOutcomeState,
+    pub result: Option<ExecutionResultProjection>,
+    pub failure_code: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
-struct ExecutionResultProjection {
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
-    output_truncated: bool,
-    is_error: bool,
+pub(crate) struct ExecutionResultProjection {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub output_truncated: bool,
+    pub is_error: bool,
 }
 
 impl TryFrom<Execution> for ExecutionOutcome {
@@ -779,7 +932,7 @@ impl TryFrom<Execution> for ExecutionOutcome {
 }
 
 #[derive(Debug)]
-enum RemoteTransportError {
+pub(crate) enum RemoteTransportError {
     NotFound,
     Conflict(String),
     Rejected { code: Code, message: String },
@@ -788,13 +941,40 @@ enum RemoteTransportError {
 
 #[cfg(test)]
 mod tests {
-    use super::request_fingerprint;
+    use std::collections::HashMap;
+
+    use agent_rt_control::Command;
+
+    use super::{RemoteCommand, request_fingerprint};
+
+    fn command(source: &str) -> RemoteCommand {
+        RemoteCommand {
+            command: Command {
+                argv: vec!["python".to_owned(), "-c".to_owned(), source.to_owned()],
+                cwd: None,
+                env: HashMap::new(),
+                stdin: Vec::new(),
+                artifact_paths: Vec::new(),
+            },
+            timeout: None,
+            max_output_bytes: None,
+        }
+    }
 
     #[test]
     fn request_fingerprint_is_bound_to_route_workspace_and_code() {
-        let base = request_fingerprint("route-a", "workspace-a", "print(1)");
-        assert_ne!(base, request_fingerprint("route-b", "workspace-a", "print(1)"));
-        assert_ne!(base, request_fingerprint("route-a", "workspace-b", "print(1)"));
-        assert_ne!(base, request_fingerprint("route-a", "workspace-a", "print(2)"));
+        let base = request_fingerprint("route-a", "workspace-a", &[command("print(1)")]);
+        assert_ne!(
+            base,
+            request_fingerprint("route-b", "workspace-a", &[command("print(1)")])
+        );
+        assert_ne!(
+            base,
+            request_fingerprint("route-a", "workspace-b", &[command("print(1)")])
+        );
+        assert_ne!(
+            base,
+            request_fingerprint("route-a", "workspace-a", &[command("print(2)")])
+        );
     }
 }

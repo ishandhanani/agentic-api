@@ -15,7 +15,7 @@ use agentic_core::config::{
     AgentRtExecutorConfig, Config, PostgresConfig, SqliteConfig, SubjectSigningKey, ToolRuntimeConfig,
 };
 use agentic_core::executor::{ExecuteRequest, ExecutionContext};
-use agentic_core::types::io::OutputItem;
+use agentic_core::types::io::{OutputItem, ShellCallEnvironment, ShellCallOutcome, ShellCallStatus};
 use axum::extract::State;
 use axum::routing::post;
 use either::Either;
@@ -37,11 +37,11 @@ async fn inference(
     state.requests.lock().await.push(request);
     let output = if call == 0 {
         serde_json::json!([{
-            "id": "fc_code_1",
+            "id": "fc_shell_1",
             "type": "function_call",
-            "call_id": "call_code_1",
-            "name": "code_interpreter",
-            "arguments": "{\"code\":\"print(40 + 2)\"}",
+            "call_id": "call_shell_1",
+            "name": "shell",
+            "arguments": "{\"commands\":[\"printf first\",\"printf second\"],\"max_output_length\":1024}",
             "status": "completed"
         }])
     } else {
@@ -125,6 +125,19 @@ impl ExecutionService for AgentRtState {
         assert_subject(&request);
         let request = request.into_inner();
         self.execution_requests.lock().await.push(request.clone());
+        let stdout = request
+            .command
+            .as_ref()
+            .and_then(|command| command.argv.last())
+            .map_or_else(Vec::new, |command| {
+                if command == "printf first" {
+                    b"first".to_vec()
+                } else if command == "printf second" {
+                    b"second".to_vec()
+                } else {
+                    b"unexpected command".to_vec()
+                }
+            });
         Ok(Response::new(Execution {
             execution_id: request.execution_id,
             workspace_id: request.workspace_id,
@@ -133,7 +146,7 @@ impl ExecutionService for AgentRtState {
             state: ExecutionState::Succeeded as i32,
             result: Some(ExecutionResult {
                 exit_code: Some(0),
-                stdout: b"42\n".to_vec(),
+                stdout,
                 stderr: Vec::new(),
                 output_truncated: false,
             }),
@@ -223,7 +236,7 @@ fn test_config(inference_url: String, agent_rt_url: String) -> Config {
 }
 
 #[tokio::test]
-async fn code_interpreter_uses_agent_rt_grpc_and_reinjects_only_into_dynamo() {
+async fn shell_uses_one_agent_rt_workspace_and_projects_native_outputs() {
     let inference_state = InferenceState::default();
     let (inference_url, inference_server) = serve_http(
         axum::Router::new()
@@ -240,10 +253,10 @@ async fn code_interpreter_uses_agent_rt_grpc_and_reinjects_only_into_dynamo() {
     );
     let payload = serde_json::from_value(serde_json::json!({
         "model": "test-model",
-        "input": "Calculate 40 + 2 with Python.",
+        "input": "Run two shell commands.",
         "store": false,
         "stream": false,
-        "tools": [{"type": "code_interpreter"}]
+        "tools": [{"type": "shell", "environment": {"type": "container_auto"}}]
     }))
     .expect("request payload");
 
@@ -256,30 +269,67 @@ async fn code_interpreter_uses_agent_rt_grpc_and_reinjects_only_into_dynamo() {
     };
 
     assert_eq!(inference_state.calls.load(Ordering::SeqCst), 2);
-    assert!(
-        response
-            .output
-            .iter()
-            .any(|item| matches!(item, OutputItem::CodeInterpreterCall(call) if call.container_id.starts_with("ws_")))
-    );
+    let [
+        OutputItem::ShellCall(call),
+        OutputItem::ShellCallOutput(output),
+        OutputItem::Message(_),
+    ] = response.output.as_slice()
+    else {
+        panic!("expected native shell call, shell output, then assistant message");
+    };
+    assert_eq!(call.call_id, "call_shell_1");
+    assert_eq!(call.action.commands, ["printf first", "printf second"]);
+    assert_eq!(call.status, ShellCallStatus::Completed);
+    let Some(ShellCallEnvironment::ContainerReference { container_id }) = &call.environment else {
+        panic!("container_auto must project the agent-rt workspace");
+    };
+    assert!(container_id.starts_with("ws_"));
+    assert_eq!(output.call_id, "call_shell_1");
+    assert_eq!(output.status, ShellCallStatus::Completed);
+    assert_eq!(output.output.len(), 2);
+    assert_eq!(output.output[0].stdout, "first");
+    assert_eq!(output.output[1].stdout, "second");
+    assert!(matches!(
+        output.output[0].outcome,
+        ShellCallOutcome::Exit { exit_code: 0 }
+    ));
+    assert!(matches!(
+        output.output[1].outcome,
+        ShellCallOutcome::Exit { exit_code: 0 }
+    ));
     let inference_requests = inference_state.requests.lock().await;
     assert_eq!(inference_requests.len(), 2);
     let reinjected = inference_requests[1].to_string();
-    assert!(reinjected.contains("call_code_1"));
+    assert!(reinjected.contains("call_shell_1"));
     assert!(reinjected.contains("function_call_output"));
+    assert!(reinjected.contains("first"));
+    assert!(reinjected.contains("second"));
+    assert!(!reinjected.contains("shell_call_output"));
     assert!(!reinjected.contains("previous_response_id"));
 
     let workspace_requests = agent_rt_state.workspace_requests.lock().await;
     assert_eq!(workspace_requests.len(), 1);
     assert_eq!(workspace_requests[0].workspace_class_id, "python.default");
     let execution_requests = agent_rt_state.execution_requests.lock().await;
-    assert_eq!(execution_requests.len(), 1);
-    assert_eq!(execution_requests[0].route_id, "sandbox.python.default");
+    assert_eq!(execution_requests.len(), 2);
+    assert!(
+        execution_requests
+            .iter()
+            .all(|request| request.route_id == "sandbox.python.default")
+    );
+    assert_eq!(execution_requests[0].workspace_id, execution_requests[1].workspace_id);
+    assert_ne!(execution_requests[0].execution_id, execution_requests[1].execution_id);
     assert_eq!(
         execution_requests[0].command.as_ref().expect("command").argv,
-        ["python", "-c", "print(40 + 2)"]
+        ["sh", "-lc", "printf first"]
     );
-    assert_eq!(execution_requests[0].client_metadata["call_id"], "call_code_1");
+    assert_eq!(
+        execution_requests[1].command.as_ref().expect("command").argv,
+        ["sh", "-lc", "printf second"]
+    );
+    assert_eq!(execution_requests[0].client_metadata["call_id"], "call_shell_1");
+    assert_eq!(execution_requests[0].client_metadata["command_index"], "0");
+    assert_eq!(execution_requests[1].client_metadata["command_index"], "1");
 
     let ledger_state: String = sqlx::query_scalar("SELECT state FROM remote_executions")
         .fetch_one(exec_ctx.storage_pool().expect("configured ledger"))

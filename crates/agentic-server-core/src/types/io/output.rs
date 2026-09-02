@@ -379,6 +379,62 @@ pub struct CodeInterpreterCall {
     pub status: CodeInterpreterCallStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellCallStatus {
+    InProgress,
+    Completed,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellCallAction {
+    pub commands: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_length: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellCallEnvironment {
+    Local,
+    ContainerReference { container_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellCall {
+    pub id: String,
+    pub call_id: String,
+    pub action: ShellCallAction,
+    pub environment: Option<ShellCallEnvironment>,
+    pub status: ShellCallStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellCallOutcome {
+    Exit { exit_code: i32 },
+    Timeout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellCallOutputContent {
+    pub stdout: String,
+    pub stderr: String,
+    pub outcome: ShellCallOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellCallOutput {
+    pub id: String,
+    pub call_id: String,
+    pub max_output_length: Option<u64>,
+    pub output: Vec<ShellCallOutputContent>,
+    pub status: ShellCallStatus,
+}
+
 impl WebSearchCall {
     /// Builds a web-search call from a non-empty query list.
     ///
@@ -839,6 +895,10 @@ pub enum OutputItem {
     WebSearchCall(WebSearchCall),
     #[serde(rename = "code_interpreter_call")]
     CodeInterpreterCall(CodeInterpreterCall),
+    #[serde(rename = "shell_call")]
+    ShellCall(ShellCall),
+    #[serde(rename = "shell_call_output")]
+    ShellCallOutput(ShellCallOutput),
     #[serde(rename = "mcp_call")]
     McpCall(McpCall),
     #[serde(rename = "mcp_list_tools")]
@@ -862,6 +922,8 @@ impl OutputItem {
             Self::Message(_)
             | Self::WebSearchCall(_)
             | Self::CodeInterpreterCall(_)
+            | Self::ShellCall(_)
+            | Self::ShellCallOutput(_)
             | Self::McpCall(_)
             | Self::McpListTools(_)
             | Self::Reasoning(_)
@@ -883,7 +945,12 @@ impl OutputItem {
             Self::CustomToolCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
             Self::McpListTools(list_tools) => Some(InputItem::McpListTools(list_tools.clone())),
             Self::Compaction(item) => Some(InputItem::Compaction(item.clone())),
-            Self::WebSearchCall(_) | Self::CodeInterpreterCall(_) | Self::McpCall(_) | Self::Unknown => None,
+            Self::WebSearchCall(_)
+            | Self::CodeInterpreterCall(_)
+            | Self::ShellCall(_)
+            | Self::ShellCallOutput(_)
+            | Self::McpCall(_)
+            | Self::Unknown => None,
         }
     }
 }

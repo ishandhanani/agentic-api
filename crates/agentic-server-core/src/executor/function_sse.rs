@@ -142,7 +142,11 @@ impl FunctionSseTranslator {
                     defer_from_output_index: None,
                 })
             }
-            ToolType::Mcp | ToolType::WebSearch | ToolType::FileSearch | ToolType::CodeInterpreter => {
+            ToolType::Mcp
+            | ToolType::WebSearch
+            | ToolType::FileSearch
+            | ToolType::CodeInterpreter
+            | ToolType::Shell => {
                 if self.first_gateway_output_index.is_none_or(|first| output_index < first) {
                     self.first_gateway_output_index = Some(output_index);
                 }

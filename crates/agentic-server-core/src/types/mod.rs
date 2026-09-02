@@ -10,7 +10,8 @@ pub use io::{
     InputFunctionToolCall, InputImageContent, InputItem, InputMessage, InputMessageContent, InputTextContent,
     InputTokenDetails, McpCall, McpCallError, McpCallStatus, McpToolExecutionError, McpToolExecutionErrorContent,
     OutputItem, OutputMessage, OutputTextContent, OutputTokenDetails, ReasoningOutput, ReasoningTextContent,
-    ResponseUsage, ResponsesInput, ToolCallOutput, ToolChoice, ToolOutputContent, WebSearchAction,
+    ResponseUsage, ResponsesInput, ShellCall, ShellCallAction, ShellCallEnvironment, ShellCallOutcome, ShellCallOutput,
+    ShellCallOutputContent, ShellCallStatus, ToolCallOutput, ToolChoice, ToolOutputContent, WebSearchAction,
     WebSearchActionError, WebSearchActionFindInPage, WebSearchActionOpenPage, WebSearchActionSearch, WebSearchCall,
     WebSearchCallStatus, WebSearchSource,
 };
@@ -20,6 +21,8 @@ pub use request_response::{
 };
 pub use tools::{
     CodeInterpreterToolParam, CodexNamespaceMember, CodexNamespaceToolParam, CustomToolParam, EmptyToolNameError,
-    FileSearchToolParam, FunctionToolParam, McpToolParam, NonEmptyToolName, ResponsesTool, WebSearchContextSize,
-    WebSearchFilters, WebSearchToolParam, WebSearchUserLocation,
+    FileSearchToolParam, FunctionToolParam, McpToolParam, NonEmptyToolName, ResponsesTool, ShellAllowedCallerParam,
+    ShellDomainSecretParam, ShellEnvironmentParam, ShellInlineSkillMediaTypeParam, ShellInlineSkillSourceParam,
+    ShellLocalSkillParam, ShellMemoryLimitParam, ShellNetworkPolicyParam, ShellSkillParam, ShellToolParam,
+    WebSearchContextSize, WebSearchFilters, WebSearchToolParam, WebSearchUserLocation,
 };

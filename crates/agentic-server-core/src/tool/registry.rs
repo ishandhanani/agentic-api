@@ -31,6 +31,7 @@ pub enum ToolType {
     WebSearch,
     FileSearch,
     CodeInterpreter,
+    Shell,
 }
 
 impl ToolType {
@@ -44,6 +45,7 @@ impl ToolType {
             Self::WebSearch => "web search tool",
             Self::FileSearch => "file search tool",
             Self::CodeInterpreter => "code interpreter tool",
+            Self::Shell => "shell tool",
         }
     }
 
@@ -148,6 +150,13 @@ fn insert_code_interpreter_entry(entries: &mut HashMap<String, ToolEntry>, bindi
     );
 }
 
+fn insert_shell_entry(entries: &mut HashMap<String, ToolEntry>, binding: GatewayBinding) {
+    entries.insert(
+        "shell".to_owned(),
+        ToolEntry::gateway(ToolType::Shell, None, Some(binding)),
+    );
+}
+
 /// Request-scoped registry built from `RequestPayload.tools`.
 /// Maps the name the LLM sees → routing metadata.
 #[derive(Debug, Default)]
@@ -246,6 +255,14 @@ impl ToolRegistry {
                     })?;
                     insert_unique_tool_entries(&mut entries, |resolved| {
                         insert_code_interpreter_entry(resolved, Some(binding));
+                    })?;
+                }
+                ResponsesTool::Shell(p) => {
+                    let binding = executors.binding(ToolType::Shell, p)?.ok_or_else(|| {
+                        ToolError::Config("shell requires an operator-configured gateway executor".to_owned())
+                    })?;
+                    insert_unique_tool_entries(&mut entries, |resolved| {
+                        insert_shell_entry(resolved, binding);
                     })?;
                 }
                 ResponsesTool::Namespace(p) => {

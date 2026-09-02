@@ -151,7 +151,7 @@ async fn run_until_gateway_tools_complete(
             emit_response_start_events(&payload, stream_accumulator, stream_sender)?;
             let event_plans = compaction_event_plans(&payload.output, 0);
             emit_gateway_start_events(&event_plans, stream_accumulator, stream_sender)?;
-            emit_gateway_completed_events(&payload.output, &event_plans, stream_accumulator, stream_sender)?;
+            emit_gateway_completed_events(&event_plans, stream_accumulator, stream_sender)?;
         }
         return Ok((payload, ctx));
     }
@@ -388,7 +388,7 @@ async fn execute_and_emit_ordered_output_calls(
     let mut scheduler = GatewayScheduler::plan_for_request(output_items, registry, output_offset, policy, ctx);
     let initial_event_run_len = scheduler.initial_event_run_len(output_items, registry);
     emit_gateway_start_events(
-        scheduler.event_plans().take(initial_event_run_len),
+        scheduler.event_plans_for_initial_calls(initial_event_run_len),
         stream_accumulator,
         stream_sender,
     )?;
@@ -396,14 +396,13 @@ async fn execute_and_emit_ordered_output_calls(
     let gateway_results = scheduler.execute().await?;
     for (index, output_events) in events_by_output.iter_mut().enumerate() {
         if let Some(call_index) = scheduler.call_index_for_item(index) {
-            let plan = scheduler
-                .event_plan(call_index)
-                .expect("scheduled call index always has an event plan");
-            let result = std::slice::from_ref(&gateway_results[call_index]);
+            let plans = scheduler
+                .event_plans_for_call(call_index)
+                .expect("scheduled call index always has event plans");
             if call_index >= initial_event_run_len {
-                emit_gateway_start_events(std::iter::once(plan), stream_accumulator, stream_sender)?;
+                emit_gateway_start_events(plans, stream_accumulator, stream_sender)?;
             }
-            emit_gateway_completed_events(result, std::iter::once(plan), stream_accumulator, stream_sender)?;
+            emit_gateway_completed_events(plans, stream_accumulator, stream_sender)?;
             emit_deferred_stream_events(
                 std::mem::take(output_events),
                 ctx,

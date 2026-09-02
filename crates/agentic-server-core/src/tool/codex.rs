@@ -404,6 +404,7 @@ fn typed_top_level_registry_keys(tools: &[ResponsesTool]) -> HashMap<String, Too
                 ResponsesTool::WebSearch(_) => "web_search".to_owned(),
                 ResponsesTool::FileSearch(_) => "file_search".to_owned(),
                 ResponsesTool::CodeInterpreter(_) => "code_interpreter".to_owned(),
+                ResponsesTool::Shell(_) => "shell".to_owned(),
                 ResponsesTool::Mcp(_)
                 | ResponsesTool::Namespace(_)
                 | ResponsesTool::Custom(_)

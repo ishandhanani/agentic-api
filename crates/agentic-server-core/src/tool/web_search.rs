@@ -388,17 +388,17 @@ impl GatewayExecutor for WebSearchHandler {
     }
 
     fn plan_gateway_events(&self, call: &FunctionToolCall, _params: &WebSearchToolParam) -> GatewayToolEventPlan {
-        GatewayToolEventPlan::new(started_output_item(call))
+        GatewayToolEventPlan::one(started_output_item(call))
     }
 
-    fn public_output(
+    fn public_outputs(
         &self,
         call: &FunctionToolCall,
         output: &ToolOutput,
         status: WebSearchCallStatus,
         _params: &WebSearchToolParam,
-    ) -> Option<OutputItem> {
-        output_item(call, output, status)
+    ) -> Vec<OutputItem> {
+        output_item(call, output, status).into_iter().collect()
     }
 }
 

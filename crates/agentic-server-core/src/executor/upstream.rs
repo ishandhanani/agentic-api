@@ -268,7 +268,7 @@ fn emit_mcp_discovery_lifecycle(
     let event_plans = mcp_list_tools_event_plans(&public_output, 0);
 
     emit_gateway_start_events(&event_plans, stream_accumulator, stream_sender)?;
-    emit_gateway_completed_events(&public_output, &event_plans, stream_accumulator, stream_sender)
+    emit_gateway_completed_events(&event_plans, stream_accumulator, stream_sender)
 }
 
 fn is_terminal_response_event(event_type: SSEEventType) -> bool {
