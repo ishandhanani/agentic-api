@@ -340,7 +340,9 @@ async fn execute_and_emit_round_output_calls(
     stream: Option<(&mut GatewayStreamAccumulator, &mpsc::UnboundedSender<StreamEvent>)>,
 ) -> ExecutorResult<Vec<GatewayCallResult>> {
     match (deferred_events.is_empty(), stream) {
-        (true, stream) => execute_and_emit_output_calls(output_items, registry, output_offset, policy, stream).await,
+        (true, stream) => {
+            execute_and_emit_output_calls(output_items, registry, output_offset, ctx, policy, stream).await
+        }
         (false, Some((stream_accumulator, stream_sender))) => {
             execute_and_emit_ordered_output_calls(
                 output_items,
@@ -353,7 +355,7 @@ async fn execute_and_emit_round_output_calls(
             )
             .await
         }
-        (false, None) => execute_and_emit_output_calls(output_items, registry, output_offset, policy, None).await,
+        (false, None) => execute_and_emit_output_calls(output_items, registry, output_offset, ctx, policy, None).await,
     }
 }
 
@@ -383,7 +385,7 @@ async fn execute_and_emit_ordered_output_calls(
         events_by_output[output_index].push(frame);
     }
 
-    let mut scheduler = GatewayScheduler::plan(output_items, registry, output_offset, policy);
+    let mut scheduler = GatewayScheduler::plan_for_request(output_items, registry, output_offset, policy, ctx);
     let initial_event_run_len = scheduler.initial_event_run_len(output_items, registry);
     emit_gateway_start_events(
         scheduler.event_plans().take(initial_event_run_len),
@@ -451,6 +453,12 @@ async fn run_blocking(
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
 ) -> ExecutorResult<ResponsePayload> {
+    // Axum drops the handler future when a blocking client disconnects. Keep
+    // the same cancel-on-drop contract as the streaming path so an accepted
+    // remote execution receives best-effort cancellation instead of being
+    // abandoned until its deadline.
+    let cancellation = ctx.execution_cancellation.clone();
+    let _cancel_on_drop = cancellation.drop_guard();
     let (payload, ctx) = run_until_gateway_tools_complete(ctx, exec_ctx, auth, false, None).await?;
 
     let ch = exec_ctx.conv_handler.clone();
@@ -461,7 +469,9 @@ async fn run_blocking(
 }
 
 fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>, auth: Option<String>) -> BoxStream {
+    let cancellation = ctx.execution_cancellation.clone();
     Box::pin(stream! {
+        let _cancel_on_drop = cancellation.drop_guard();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let exec_ctx_for_run = Arc::clone(&exec_ctx);
         let event_tx_for_run = event_tx.clone();
@@ -572,6 +582,7 @@ pub struct ExecuteRequest {
     payload: RequestPayload,
     exec_ctx: Arc<ExecutionContext>,
     client_auth: Option<String>,
+    subject: Option<crate::tool::AuthenticatedSubject>,
 }
 
 impl ExecuteRequest {
@@ -581,6 +592,7 @@ impl ExecuteRequest {
             payload,
             exec_ctx,
             client_auth: None,
+            subject: None,
         }
     }
 
@@ -588,6 +600,13 @@ impl ExecuteRequest {
     #[must_use]
     pub fn with_auth(mut self, token: Option<String>) -> Self {
         self.client_auth = token;
+        self
+    }
+
+    /// Supplies the authenticated subject used by side-effecting built-in tools.
+    #[must_use]
+    pub fn with_subject(mut self, subject: Option<crate::tool::AuthenticatedSubject>) -> Self {
+        self.subject = subject;
         self
     }
 
@@ -609,7 +628,8 @@ impl ExecuteRequest {
             tools = self.payload.tools.as_ref().map_or(0, Vec::len),
             "executor received responses request"
         );
-        let ctx = rehydrate_conversation(self.payload, &self.exec_ctx).await?;
+        let mut ctx = rehydrate_conversation(self.payload, &self.exec_ctx).await?;
+        ctx.subject = self.subject.or_else(|| self.exec_ctx.remote_execution_subject(None));
         if !ctx.enriched_request.input.has_compaction_trigger() {
             validate_reasoning_for_vllm(&ctx.enriched_request.input)?;
         }

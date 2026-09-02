@@ -203,6 +203,8 @@ pub(crate) async fn compact_items(
         response_id: uuid7_str("resp_"),
         conversation_id: None,
         conversation_version: None,
+        subject: None,
+        execution_cancellation: tokio_util::sync::CancellationToken::new(),
     };
     let response = fetch_blocking_payload(&ctx, exec_ctx, auth).await?;
     let summary = completed_summary_text(&response)?;

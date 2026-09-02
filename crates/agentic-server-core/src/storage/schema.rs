@@ -184,6 +184,37 @@ where
     .await
 }
 
+async fn postgres_remote_execution_schema_ready<'e, E>(executor: E) -> DbResult<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
+    sqlx::query_scalar(
+        "WITH required(column_name, is_nullable) AS ( \
+             VALUES \
+                 ('tenant_id', 'NO'), ('principal_id', 'NO'), ('response_id', 'NO'), \
+                 ('conversation_id', 'YES'), ('call_id', 'NO'), ('execution_id', 'NO'), \
+                 ('workspace_id', 'NO'), ('route_id', 'NO'), ('request_fingerprint', 'NO'), \
+                 ('absolute_deadline', 'NO'), ('state', 'NO'), ('terminal_outcome', 'YES'), \
+                 ('created_at', 'NO'), ('updated_at', 'NO') \
+         ) \
+         SELECT COUNT(*) = 14 \
+         FROM required \
+         JOIN information_schema.columns actual \
+           ON actual.table_name = 'remote_executions' \
+          AND actual.column_name = required.column_name \
+          AND actual.is_nullable = required.is_nullable \
+         JOIN pg_class table_relation \
+           ON table_relation.relname = actual.table_name \
+          AND table_relation.relkind IN ('r', 'p') \
+          AND pg_table_is_visible(table_relation.oid) \
+         JOIN pg_namespace table_namespace \
+           ON table_namespace.oid = table_relation.relnamespace \
+          AND table_namespace.nspname = actual.table_schema",
+    )
+    .fetch_one(executor)
+    .await
+}
+
 fn validate_required_postgres_schema(
     schema_column_count: i64,
     constraint_count: i64,
@@ -250,7 +281,13 @@ async fn verify_supervisor_managed_postgres_schema(
             integer_column_count,
             narrow_column_count,
             sequence_index_ready,
-        )
+        )?;
+        if !postgres_remote_execution_schema_ready(&mut *connection).await? {
+            return Err(sqlx::Error::Configuration(
+                "supervisor-managed PostgreSQL schema is missing the remote execution ledger".into(),
+            ));
+        }
+        Ok(())
     }
     .await;
     let close_result = connection.close().await;
@@ -277,7 +314,7 @@ pub(crate) async fn pin_postgres_persistence_schema(connection: &mut sqlx::AnyCo
          JOIN pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace \
          WHERE table_namespace.nspname = ANY(current_schemas(false)) \
          AND table_relation.relkind IN ('r', 'p', 'v', 'm', 'f') \
-         AND table_relation.relname IN ('_sqlx_migrations', 'conversations', 'items', 'responses') \
+         AND table_relation.relname IN ('_sqlx_migrations', 'conversations', 'items', 'responses', 'remote_executions') \
          ORDER BY table_namespace.nspname::text",
     )
     .fetch_all(&mut *connection)
@@ -334,6 +371,25 @@ pub(crate) async fn verify_persistence_writable(pool: &DbPool) -> DbResult<()> {
             Some("{}"),
         )
         .await?;
+        sqlx::query(
+            "INSERT INTO remote_executions (
+                 tenant_id, principal_id, response_id, call_id, execution_id,
+                 workspace_id, route_id, request_fingerprint, absolute_deadline,
+                 state, created_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'claimed', $10, $10)",
+        )
+        .bind("readiness")
+        .bind("readiness")
+        .bind(&response_id)
+        .bind("call_readiness")
+        .bind(format!("exec_{suffix}"))
+        .bind(format!("ws_{suffix}"))
+        .bind("readiness")
+        .bind("readiness")
+        .bind(created_at.saturating_add(60))
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
         Ok(())
     }
     .await;
@@ -359,10 +415,13 @@ pub(crate) async fn verify_persistence_ready(pool: &DbPool) -> DbResult<()> {
                          ('items', 'SELECT'), \
                          ('items', 'INSERT'), \
                          ('responses', 'SELECT'), \
-                         ('responses', 'INSERT') \
+                         ('responses', 'INSERT'), \
+                         ('remote_executions', 'SELECT'), \
+                         ('remote_executions', 'INSERT'), \
+                         ('remote_executions', 'UPDATE') \
                  ) \
                  SELECT current_setting('transaction_read_only') = 'off' \
-                    AND COUNT(table_relation.oid) = 7 \
+                    AND COUNT(table_relation.oid) = 10 \
                     AND COALESCE(BOOL_AND( \
                         has_table_privilege(current_user, table_relation.oid, required.privilege) \
                     ), false) \
@@ -391,6 +450,7 @@ pub(crate) async fn verify_persistence_ready(pool: &DbPool) -> DbResult<()> {
                 "SELECT id FROM conversations LIMIT 0",
                 "SELECT id FROM items LIMIT 0",
                 "SELECT id FROM responses LIMIT 0",
+                "SELECT execution_id FROM remote_executions LIMIT 0",
             ] {
                 sqlx::query(statement).execute(&mut *connection).await?;
             }

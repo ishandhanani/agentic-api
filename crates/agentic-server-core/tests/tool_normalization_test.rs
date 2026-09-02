@@ -103,6 +103,8 @@ fn upstream_request_value(payload: RequestPayload, stream: bool) -> Value {
         response_id: "resp_test".to_string(),
         conversation_id: None,
         conversation_version: None,
+        subject: None,
+        execution_cancellation: tokio_util::sync::CancellationToken::new(),
     };
     let upstream_request = ctx
         .enriched_request

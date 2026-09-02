@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -6,7 +7,7 @@ use tokio::sync::RwLock;
 use super::mcp::handler::McpServerToolSet;
 use super::mcp::{McpClientPool, McpDiscoveredHandler, McpHandler};
 use super::web_search::{WebSearchExecutor, WebSearchHandler};
-use super::{GatewayExecutor, ToolError};
+use super::{GatewayBinding, GatewayExecutor, ToolError, ToolType};
 use crate::config::ToolRuntimeConfig;
 use crate::types::tools::McpToolParam;
 
@@ -16,6 +17,38 @@ pub enum GatewayExecutorRegistration {
         server_label: String,
         handlers: Vec<McpDiscoveredHandler>,
     },
+}
+
+trait GatewayBindingFactory: Send + Sync {
+    fn bind(&self, params: &dyn Any) -> Result<GatewayBinding, ToolError>;
+}
+
+struct TypedGatewayBindingFactory<E>
+where
+    E: GatewayExecutor,
+{
+    executor: Arc<E>,
+}
+
+impl<E> GatewayBindingFactory for TypedGatewayBindingFactory<E>
+where
+    E: GatewayExecutor,
+    E::ToolParams: Clone + Any,
+    E::ExecutionParams: From<E::ToolParams>,
+{
+    fn bind(&self, params: &dyn Any) -> Result<GatewayBinding, ToolError> {
+        let params = params.downcast_ref::<E::ToolParams>().ok_or_else(|| {
+            ToolError::Config(format!(
+                "registered {} executor received incompatible declaration parameters",
+                self.executor.tool_type().description()
+            ))
+        })?;
+        self.executor.validate(params)?;
+        Ok(GatewayBinding::new(
+            Arc::clone(&self.executor),
+            E::ExecutionParams::from(params.clone()),
+        ))
+    }
 }
 
 impl<T> From<Arc<T>> for GatewayExecutorRegistration
@@ -43,6 +76,7 @@ impl From<Arc<WebSearchExecutor>> for GatewayExecutorRegistration {
 /// lazily unless handlers were registered with [`Self::insert`].
 #[derive(Clone, Default)]
 pub struct GatewayExecutors {
+    generic: HashMap<ToolType, Arc<dyn GatewayBindingFactory>>,
     mcp: HashMap<String, Vec<McpDiscoveredHandler>>,
     mcp_configs: HashMap<String, super::mcp::McpServerEntry>,
     mcp_clients: Arc<RwLock<HashMap<String, Arc<super::mcp::McpClient>>>>,
@@ -55,6 +89,7 @@ impl GatewayExecutors {
     #[must_use]
     pub fn from_env(client: Arc<reqwest::Client>) -> Self {
         Self {
+            generic: HashMap::new(),
             mcp: HashMap::new(),
             mcp_configs: HashMap::new(),
             mcp_clients: Arc::new(RwLock::new(HashMap::new())),
@@ -75,6 +110,7 @@ impl GatewayExecutors {
     /// discovery happen when a configured server is requested.
     pub fn from_config(client: Arc<reqwest::Client>, config: &ToolRuntimeConfig) -> Result<Self, ToolError> {
         let executors = Self {
+            generic: HashMap::new(),
             mcp: HashMap::new(),
             mcp_configs: config.mcp_servers.clone(),
             mcp_clients: Arc::new(RwLock::new(HashMap::new())),
@@ -119,6 +155,25 @@ impl GatewayExecutors {
                 }
             }
         }
+    }
+
+    /// Registers a typed executor by logical tool type. The executor's concrete
+    /// provider is deliberately absent from the registry surface.
+    pub fn register<E>(&mut self, executor: Arc<E>)
+    where
+        E: GatewayExecutor,
+        E::ToolParams: Clone + Any,
+        E::ExecutionParams: From<E::ToolParams>,
+    {
+        self.generic
+            .insert(executor.tool_type(), Arc::new(TypedGatewayBindingFactory { executor }));
+    }
+
+    pub(crate) fn binding<P: Any>(&self, tool_type: ToolType, params: &P) -> Result<Option<GatewayBinding>, ToolError> {
+        self.generic
+            .get(&tool_type)
+            .map(|factory| factory.bind(params))
+            .transpose()
     }
 
     /// Always returns a real handler — falls back to [`WebSearchHandler::spec_only`]
@@ -301,6 +356,7 @@ impl std::fmt::Debug for GatewayExecutors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GatewayExecutors")
             .field("mcp_server_handlers", &self.mcp.len())
+            .field("generic_handlers", &self.generic.len())
             .field("mcp_server_configs", &self.mcp_configs.len())
             .field("mcp_clients", &Arc::strong_count(&self.mcp_clients))
             .field("mcp_discovered", &Arc::strong_count(&self.mcp_discovered))

@@ -91,12 +91,49 @@ pub struct WebSearchProviderConfig {
     pub base_url: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct SubjectSigningKey(String);
+
+impl SubjectSigningKey {
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SubjectSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SubjectSigningKey([REDACTED])")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentRtExecutorConfig {
+    pub endpoint: String,
+    pub route_id: String,
+    pub subject_signing_key: SubjectSigningKey,
+    pub subject_issuer: String,
+    pub subject_audience: String,
+    pub tenant_id: String,
+    pub default_principal_id: String,
+    pub execution_timeout: Duration,
+    pub transport_timeout: Duration,
+    pub lookup_wait: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolRuntimeConfig {
     pub web_search: WebSearchProviderConfig,
     pub mcp_servers: HashMap<String, McpServerEntry>,
     pub mcp_allowed_hosts: Vec<String>,
     pub messages_gateway_tool_aliases: Option<String>,
+    /// Optional direct remote executor for managed-environment built-in tools.
+    pub agent_rt: Option<AgentRtExecutorConfig>,
     /// Upper bound on gateway-owned tool calls executing concurrently within one
     /// round. A sliding window admits another call as one finishes. Handlers with
     /// nested outbound work also use this value as their provider-level concurrency
@@ -113,6 +150,7 @@ impl Default for ToolRuntimeConfig {
             mcp_servers: HashMap::default(),
             mcp_allowed_hosts: Vec::default(),
             messages_gateway_tool_aliases: None,
+            agent_rt: None,
             max_concurrent_gateway_calls: DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS,
         }
     }

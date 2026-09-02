@@ -16,7 +16,7 @@ use crate::events::WireEvent;
 
 use crate::types::io::output::{FunctionToolCall, McpListTools};
 use crate::types::io::{InputItem, OutputItem, ResponsesInput};
-use crate::types::tools::{CodeInterpreterToolParam, FileSearchToolParam, ResponsesTool};
+use crate::types::tools::{FileSearchToolParam, ResponsesTool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -141,10 +141,10 @@ fn insert_file_search_entry(entries: &mut HashMap<String, ToolEntry>, _params: &
 
 // TODO: move to a dedicated code_interpreter module alongside its `ToolHandler`
 // once code_interpreter execution is implemented.
-fn insert_code_interpreter_entry(entries: &mut HashMap<String, ToolEntry>, _params: &CodeInterpreterToolParam) {
+fn insert_code_interpreter_entry(entries: &mut HashMap<String, ToolEntry>, binding: Option<GatewayBinding>) {
     entries.insert(
         "code_interpreter".to_owned(),
-        ToolEntry::gateway(ToolType::CodeInterpreter, None, None),
+        ToolEntry::gateway(ToolType::CodeInterpreter, None, binding),
     );
 }
 
@@ -239,8 +239,13 @@ impl ToolRegistry {
                     insert_unique_tool_entries(&mut entries, |resolved| insert_file_search_entry(resolved, p))?;
                 }
                 ResponsesTool::CodeInterpreter(p) => {
+                    let binding = executors.binding(ToolType::CodeInterpreter, p)?.ok_or_else(|| {
+                        ToolError::Config(
+                            "code_interpreter requires an operator-configured gateway executor".to_owned(),
+                        )
+                    })?;
                     insert_unique_tool_entries(&mut entries, |resolved| {
-                        insert_code_interpreter_entry(resolved, p);
+                        insert_code_interpreter_entry(resolved, Some(binding));
                     })?;
                 }
                 ResponsesTool::Namespace(p) => {
@@ -377,13 +382,21 @@ impl ToolRegistry {
         let tool_type = entry.tool_type;
         Some(GatewayDispatchResult {
             tool_type,
-            output: binding.execute(&call.call_id, &call.name, &call.arguments).await,
+            output: binding
+                .execute(
+                    crate::tool::GatewayExecutionContext::compatibility(&call.call_id),
+                    &call.name,
+                    &call.arguments,
+                )
+                .await,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
 
     use super::*;
@@ -392,6 +405,44 @@ mod tests {
     use crate::types::event::MessageStatus;
     use crate::types::io::output::McpListTool;
     use crate::types::tools::McpDiscoveredToolParam;
+
+    struct TestCodeInterpreter;
+
+    impl crate::tool::ToolHandler for TestCodeInterpreter {
+        type ToolParams = crate::types::tools::CodeInterpreterToolParam;
+
+        fn tool_type(&self) -> ToolType {
+            ToolType::CodeInterpreter
+        }
+
+        fn validate(&self, _params: &Self::ToolParams) -> Result<(), ToolError> {
+            Ok(())
+        }
+
+        fn normalize(&self, _params: &Self::ToolParams) -> Vec<crate::types::io::FunctionTool> {
+            vec![crate::tool::code_interpreter::code_interpreter_function_tool()]
+        }
+    }
+
+    impl crate::tool::GatewayExecutor for TestCodeInterpreter {
+        type ExecutionParams = crate::types::tools::CodeInterpreterToolParam;
+
+        fn execute(
+            &self,
+            call_id: &str,
+            _tool_name: &str,
+            _arguments: &str,
+            _params: &Self::ExecutionParams,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let call_id = call_id.to_owned();
+            Box::pin(async move {
+                Ok(ToolOutput {
+                    call_id,
+                    output: "{}".to_owned(),
+                })
+            })
+        }
+    }
 
     fn declaration(server_label: &str) -> ResponsesTool {
         serde_json::from_value(serde_json::json!({
@@ -613,6 +664,7 @@ mod tests {
                 discovered_handler("counter", "get_value", "mcp__counter__get_value"),
             ],
         });
+        executors.register(Arc::new(TestCodeInterpreter));
         let mut tools = mixed_tool_declarations();
 
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
@@ -631,7 +683,7 @@ mod tests {
             ("mcp__counter__get_value", ToolType::Mcp, Some("counter"), true),
             ("web_search", ToolType::WebSearch, None, true),
             ("file_search", ToolType::FileSearch, None, false),
-            ("code_interpreter", ToolType::CodeInterpreter, None, false),
+            ("code_interpreter", ToolType::CodeInterpreter, None, true),
             (
                 "agentic_ns__mcp__shell__run",
                 ToolType::CodexNamespace,

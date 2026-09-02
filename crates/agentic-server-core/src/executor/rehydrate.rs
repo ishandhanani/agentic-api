@@ -110,6 +110,8 @@ pub async fn rehydrate_conversation(
         response_id,
         conversation_id: None,
         conversation_version: None,
+        subject: None,
+        execution_cancellation: tokio_util::sync::CancellationToken::new(),
     };
 
     if ctx.original_request.conversation_id.is_some() && ctx.original_request.previous_response_id.is_some() {

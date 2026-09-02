@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::handler::{GatewayExecutor, GatewayToolEventPlan, ToolError, ToolOutput};
+use super::handler::{GatewayExecutionContext, GatewayExecutor, GatewayToolEventPlan, ToolError, ToolOutput};
 use crate::types::io::OutputItem;
 use crate::types::io::output::{FunctionToolCall, GatewayCallStatus};
 
@@ -14,7 +14,7 @@ use crate::types::io::output::{FunctionToolCall, GatewayCallStatus};
 trait ErasedGatewayExecutor: Send + Sync {
     fn execute(
         &self,
-        call_id: &str,
+        context: GatewayExecutionContext,
         tool_name: &str,
         arguments: &str,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>>;
@@ -43,11 +43,12 @@ where
 {
     fn execute(
         &self,
-        call_id: &str,
+        context: GatewayExecutionContext,
         tool_name: &str,
         arguments: &str,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        self.executor.execute(call_id, tool_name, arguments, &self.params)
+        self.executor
+            .execute_with_context(context, tool_name, arguments, &self.params)
     }
 
     fn plan_gateway_events(&self, call: &FunctionToolCall) -> GatewayToolEventPlan {
@@ -72,6 +73,9 @@ pub struct GatewayBinding {
     /// at registration time); `None` when it's safe to call itself concurrently.
     /// Never gates against other tool names.
     pub self_exclusion: Option<Arc<tokio::sync::Semaphore>>,
+    /// True when the executor must remain polled until it performs its own
+    /// deadline/cancellation reconciliation.
+    pub(crate) manages_execution_deadline: bool,
 }
 
 impl Clone for GatewayBinding {
@@ -79,6 +83,7 @@ impl Clone for GatewayBinding {
         Self {
             executor: Arc::clone(&self.executor),
             self_exclusion: self.self_exclusion.clone(),
+            manages_execution_deadline: self.manages_execution_deadline,
         }
     }
 }
@@ -91,19 +96,21 @@ impl GatewayBinding {
     {
         let self_exclusion =
             (!executor.supports_parallel_execution()).then(|| Arc::new(tokio::sync::Semaphore::new(1)));
+        let manages_execution_deadline = executor.manages_execution_deadline();
         Self {
             executor: Arc::new(TypedGatewayExecutor { executor, params }),
             self_exclusion,
+            manages_execution_deadline,
         }
     }
 
     pub(crate) fn execute(
         &self,
-        call_id: &str,
+        context: GatewayExecutionContext,
         tool_name: &str,
         arguments: &str,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        self.executor.execute(call_id, tool_name, arguments)
+        self.executor.execute(context, tool_name, arguments)
     }
 
     #[must_use]

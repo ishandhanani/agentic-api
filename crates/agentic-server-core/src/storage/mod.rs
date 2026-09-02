@@ -18,6 +18,9 @@ pub mod models;
 // Response storage operations
 pub mod response;
 
+// Durable logical-call to remote-execution mapping.
+pub mod remote_execution;
+
 // Conversation storage operations
 pub mod conversation;
 
@@ -30,6 +33,9 @@ pub use models::Response as DbResponse;
 pub use pool::{
     DbPool, DbResult, DbTransaction, create_pool, create_pool_with_configs, create_pool_with_schema,
     create_pool_with_schema_and_configs, create_pool_with_schema_and_sqlite_config, create_pool_with_sqlite_config,
+};
+pub use remote_execution::{
+    ClaimRemoteExecution, RemoteExecutionLedger, RemoteExecutionLedgerError, RemoteExecutionLink,
 };
 pub use response::ResponseStore;
 pub use schema::{PoolWithSchema, SchemaManager};

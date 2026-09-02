@@ -1,5 +1,5 @@
 use std::num::NonZeroUsize;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::future::join_all;
 use tokio::sync::Semaphore;
@@ -9,7 +9,7 @@ use crate::events::SSEEventType;
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent, emit_sse_frame, synthetic_event};
 use crate::executor::request::RequestContext;
-use crate::tool::{GatewayBinding, ToolError, ToolOutput, ToolOwnership, ToolRegistry};
+use crate::tool::{GatewayBinding, GatewayExecutionContext, ToolError, ToolOutput, ToolOwnership, ToolRegistry};
 use crate::types::io::output::{FunctionToolCall, GatewayCallStatus, McpCallStatus};
 use crate::types::io::{InputItem, OutputItem, ResponsesInput};
 use crate::types::request_response::ResponsePayload;
@@ -22,12 +22,31 @@ use crate::utils::common::{serialize_to_string, serialize_to_value};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GatewaySchedulerPolicy {
     max_concurrent_calls: NonZeroUsize,
+    execution_timeout: Duration,
+    dispatch_timeout: Duration,
 }
 
 impl GatewaySchedulerPolicy {
     #[must_use]
     pub(crate) const fn new(max_concurrent_calls: NonZeroUsize) -> Self {
-        Self { max_concurrent_calls }
+        Self {
+            max_concurrent_calls,
+            execution_timeout: GATEWAY_TOOL_TIMEOUT,
+            dispatch_timeout: GATEWAY_TOOL_TIMEOUT,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn with_timeouts(
+        max_concurrent_calls: NonZeroUsize,
+        execution_timeout: Duration,
+        dispatch_timeout: Duration,
+    ) -> Self {
+        Self {
+            max_concurrent_calls,
+            execution_timeout,
+            dispatch_timeout,
+        }
     }
 }
 
@@ -106,24 +125,87 @@ pub(super) struct GatewayScheduler {
     calls: Vec<GatewayCallPlan>,
     policy: GatewaySchedulerPolicy,
     timeout: Duration,
+    execution_timeout: Duration,
+    request: GatewayRequestScope,
+}
+
+#[derive(Clone, Default)]
+struct GatewayRequestScope {
+    response_id: String,
+    conversation_id: Option<String>,
+    subject: Option<crate::tool::AuthenticatedSubject>,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl GatewayScheduler {
+    #[cfg(test)]
     pub(super) fn plan(
         output_items: &[OutputItem],
         registry: &ToolRegistry,
         output_offset: usize,
         policy: GatewaySchedulerPolicy,
     ) -> Self {
-        Self::plan_with_timeout(output_items, registry, output_offset, policy, GATEWAY_TOOL_TIMEOUT)
+        Self::plan_with_timeout_and_scope(
+            output_items,
+            registry,
+            output_offset,
+            policy,
+            policy.execution_timeout,
+            policy.dispatch_timeout,
+            GatewayRequestScope::default(),
+        )
     }
 
+    pub(super) fn plan_for_request(
+        output_items: &[OutputItem],
+        registry: &ToolRegistry,
+        output_offset: usize,
+        policy: GatewaySchedulerPolicy,
+        request: &RequestContext,
+    ) -> Self {
+        Self::plan_with_timeout_and_scope(
+            output_items,
+            registry,
+            output_offset,
+            policy,
+            policy.execution_timeout,
+            policy.dispatch_timeout,
+            GatewayRequestScope {
+                response_id: request.response_id.clone(),
+                conversation_id: request.conversation_id.clone(),
+                subject: request.subject.clone(),
+                cancellation: request.execution_cancellation.clone(),
+            },
+        )
+    }
+
+    #[cfg(test)]
     fn plan_with_timeout(
         output_items: &[OutputItem],
         registry: &ToolRegistry,
         output_offset: usize,
         policy: GatewaySchedulerPolicy,
         timeout: Duration,
+    ) -> Self {
+        Self::plan_with_timeout_and_scope(
+            output_items,
+            registry,
+            output_offset,
+            policy,
+            timeout,
+            timeout,
+            GatewayRequestScope::default(),
+        )
+    }
+
+    fn plan_with_timeout_and_scope(
+        output_items: &[OutputItem],
+        registry: &ToolRegistry,
+        output_offset: usize,
+        policy: GatewaySchedulerPolicy,
+        execution_timeout: Duration,
+        timeout: Duration,
+        request: GatewayRequestScope,
     ) -> Self {
         let calls = output_items
             .iter()
@@ -158,7 +240,13 @@ impl GatewayScheduler {
                 })
             })
             .collect();
-        Self { calls, policy, timeout }
+        Self {
+            calls,
+            policy,
+            timeout,
+            execution_timeout,
+            request,
+        }
     }
 
     #[cfg(test)]
@@ -257,15 +345,33 @@ impl GatewayScheduler {
         };
         let _execution_slot = execution_slots.acquire().await.expect("semaphore is never closed");
 
-        let dispatched = if self.timeout.is_zero() {
-            binding.execute(&call.call_id, &call.name, &call.arguments).await
+        let response_id = if self.request.response_id.is_empty() {
+            "compatibility"
         } else {
-            match tokio::time::timeout(
-                self.timeout,
-                binding.execute(&call.call_id, &call.name, &call.arguments),
-            )
-            .await
-            {
+            self.request.response_id.as_str()
+        };
+        let (execution_id, workspace_id) = crate::storage::remote_execution::stable_execution_identity(
+            self.request.subject.as_ref(),
+            response_id,
+            self.request.conversation_id.as_deref(),
+            &call.call_id,
+        );
+        let context = GatewayExecutionContext {
+            response_id: response_id.to_owned(),
+            conversation_id: self.request.conversation_id.clone(),
+            call_id: call.call_id.clone(),
+            execution_id,
+            workspace_id,
+            subject: self.request.subject.clone(),
+            absolute_deadline: (!self.execution_timeout.is_zero()).then(|| SystemTime::now() + self.execution_timeout),
+            cancellation: self.request.cancellation.clone(),
+            trace_context: crate::tool::TraceContext::default(),
+        };
+
+        let dispatched = if self.timeout.is_zero() || binding.manages_execution_deadline {
+            binding.execute(context, &call.name, &call.arguments).await
+        } else {
+            match tokio::time::timeout(self.timeout, binding.execute(context, &call.name, &call.arguments)).await {
                 Ok(output) => output,
                 Err(_elapsed) => Err(ToolError::Execution(format!(
                     "gateway tool '{}' timed out after {:?}",
@@ -278,7 +384,9 @@ impl GatewayScheduler {
             Err(ToolError::Execution(message) | ToolError::Config(message)) => {
                 (execution_error_output(&call, &message)?, GatewayCallStatus::Failed)
             }
-            Err(error @ ToolError::MissingOutput { .. }) => return Err(ExecutorError::from(error)),
+            Err(error @ (ToolError::MissingOutput { .. } | ToolError::OutcomeUnknown { .. })) => {
+                return Err(ExecutorError::from(error));
+            }
         };
         let public_output = binding.public_output(&call, &output, status);
         Ok(GatewayCallResult {
@@ -468,6 +576,7 @@ pub(super) fn emit_gateway_start_events<'a>(
             OutputItem::Message(_)
             | OutputItem::FunctionCall(_)
             | OutputItem::CustomToolCall(_)
+            | OutputItem::CodeInterpreterCall(_)
             | OutputItem::Reasoning(_)
             | OutputItem::Compaction(_)
             | OutputItem::Unknown => {}
@@ -491,6 +600,17 @@ pub(super) fn emit_gateway_completed_events<'a, T: GatewayPublicOutputSource>(
             continue;
         };
         let output_index = plan.output_index;
+        let item = output_item_value(public_output)?;
+        if plan.started_output.is_none() {
+            let mut added_event = synthetic_event(
+                SSEEventType::OutputItemAdded,
+                [
+                    ("output_index".to_owned(), serde_json::json!(output_index)),
+                    ("item".to_owned(), item.clone()),
+                ],
+            )?;
+            emit_gateway_event(&mut added_event, stream_accumulator, stream_sender)?;
+        }
         let completed_event = match public_output {
             OutputItem::WebSearchCall(web_search_call) => {
                 Some((SSEEventType::WebSearchCallCompleted, web_search_call.id.as_str()))
@@ -511,6 +631,9 @@ pub(super) fn emit_gateway_completed_events<'a, T: GatewayPublicOutputSource>(
                 },
                 list_tools.id.as_str(),
             )),
+            OutputItem::CodeInterpreterCall(call) => {
+                Some((SSEEventType::CodeInterpreterCallCompleted, call.id.as_str()))
+            }
             OutputItem::Compaction(_) => None,
             OutputItem::Message(_)
             | OutputItem::FunctionCall(_)
@@ -518,7 +641,6 @@ pub(super) fn emit_gateway_completed_events<'a, T: GatewayPublicOutputSource>(
             | OutputItem::Reasoning(_)
             | OutputItem::Unknown => continue,
         };
-        let item = output_item_value(public_output)?;
         if let Some((event_type, item_id)) = completed_event {
             let mut completed_fields = serde_json::Map::from_iter([
                 ("item_id".to_owned(), serde_json::json!(item_id)),
@@ -546,13 +668,14 @@ pub(super) async fn execute_and_emit_output_calls(
     output_items: &[OutputItem],
     registry: &ToolRegistry,
     output_offset: usize,
+    request: &RequestContext,
     policy: GatewaySchedulerPolicy,
     mut stream: Option<(
         &mut GatewayStreamAccumulator,
         &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     )>,
 ) -> ExecutorResult<Vec<GatewayCallResult>> {
-    let mut scheduler = GatewayScheduler::plan(output_items, registry, output_offset, policy);
+    let mut scheduler = GatewayScheduler::plan_for_request(output_items, registry, output_offset, policy, request);
     if let Some((stream_accumulator, stream_sender)) = stream.as_mut() {
         emit_gateway_start_events(scheduler.event_plans(), stream_accumulator, stream_sender)?;
     }
@@ -710,6 +833,53 @@ mod tests {
         }
     }
 
+    struct DeadlineManagedSlowExecutor;
+
+    impl ToolHandler for DeadlineManagedSlowExecutor {
+        type ToolParams = WebSearchToolParam;
+
+        fn tool_type(&self) -> ToolType {
+            ToolType::WebSearch
+        }
+
+        fn validate(&self, _params: &WebSearchToolParam) -> Result<(), ToolError> {
+            Ok(())
+        }
+
+        fn normalize(&self, _params: &WebSearchToolParam) -> Vec<FunctionTool> {
+            Vec::new()
+        }
+    }
+
+    impl GatewayExecutor for DeadlineManagedSlowExecutor {
+        type ExecutionParams = WebSearchToolParam;
+
+        fn execute(
+            &self,
+            call_id: &str,
+            _tool_name: &str,
+            _arguments: &str,
+            _params: &WebSearchToolParam,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let call_id = call_id.to_owned();
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                Ok(ToolOutput {
+                    call_id,
+                    output: "authoritative".to_owned(),
+                })
+            })
+        }
+
+        fn supports_parallel_execution(&self) -> bool {
+            true
+        }
+
+        fn manages_execution_deadline(&self) -> bool {
+            true
+        }
+    }
+
     fn web_search_call(call_id: &str) -> FunctionToolCall {
         FunctionToolCall {
             id: format!("fc_{call_id}"),
@@ -755,6 +925,33 @@ mod tests {
             body.contains("timed out"),
             "error output should mention the timeout: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn deadline_managed_call_is_not_dropped_by_generic_timeout() {
+        let web_search: ResponsesTool =
+            serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
+        let mut executors = GatewayExecutors::default();
+        executors.insert(Arc::new(DeadlineManagedSlowExecutor));
+        let mut tools = [web_search];
+        let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
+            .await
+            .expect("registry builds");
+        let output_items = [OutputItem::FunctionCall(web_search_call("call_managed"))];
+        let mut scheduler =
+            GatewayScheduler::plan_with_test_timeout(&output_items, &registry, 0, std::time::Duration::from_millis(1));
+
+        let result = scheduler
+            .execute()
+            .await
+            .expect("deadline-managed executor completes authoritatively")
+            .remove(0);
+        let InputItem::FunctionCallOutput(output) = result.input_item else {
+            panic!("expected a function_call_output");
+        };
+        let body = serde_json::to_string(&output).expect("serialize output");
+        assert!(body.contains("authoritative"));
+        assert!(!body.contains("timed out"));
     }
 
     #[tokio::test]
@@ -1091,6 +1288,8 @@ mod tests {
             calls,
             policy: GatewaySchedulerPolicy::new(NonZeroUsize::new(2).expect("nonzero test limit")),
             timeout: std::time::Duration::ZERO,
+            execution_timeout: std::time::Duration::ZERO,
+            request: super::GatewayRequestScope::default(),
         };
 
         let execution = tokio::spawn(async move { scheduler.execute().await });
@@ -1135,6 +1334,8 @@ mod tests {
             calls,
             policy: GatewaySchedulerPolicy::new(NonZeroUsize::new(2).expect("nonzero test limit")),
             timeout: std::time::Duration::ZERO,
+            execution_timeout: std::time::Duration::ZERO,
+            request: super::GatewayRequestScope::default(),
         };
 
         let execution = tokio::spawn(async move { scheduler.execute().await });

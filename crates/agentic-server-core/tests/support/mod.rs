@@ -481,6 +481,7 @@ pub fn output_text(payload: &ResponsePayload) -> String {
             OutputItem::FunctionCall(_)
             | OutputItem::CustomToolCall(_)
             | OutputItem::WebSearchCall(_)
+            | OutputItem::CodeInterpreterCall(_)
             | OutputItem::McpCall(_)
             | OutputItem::McpListTools(_)
             | OutputItem::Reasoning(_)
