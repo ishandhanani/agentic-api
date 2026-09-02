@@ -1,5 +1,6 @@
 mod accumulator_throughput;
 mod executor_throughput;
+mod integration_overhead;
 mod storage_concurrent;
 mod storage_crud;
 
@@ -9,5 +10,6 @@ criterion_main!(
     storage_crud::storage_benches,
     storage_concurrent::storage_concurrent_benches,
     executor_throughput::executor_benches,
+    integration_overhead::integration_overhead_benches,
     accumulator_throughput::accumulator_benches,
 );
