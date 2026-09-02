@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,17 +17,12 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 
-use super::{GatewayExecutionContext, GatewayExecutor, ToolError, ToolHandler, ToolOutput, ToolType};
+use super::{GatewayExecutionContext, ToolError, ToolOutput};
 use crate::config::AgentRtExecutorConfig;
 use crate::storage::{ClaimRemoteExecution, RemoteExecutionLedger, RemoteExecutionLink};
-use crate::types::io::output::{
-    CodeInterpreterCall, CodeInterpreterCallStatus, CodeInterpreterOutput, FunctionToolCall, GatewayCallStatus,
-};
-use crate::types::io::{FunctionTool, OutputItem};
-use crate::types::tools::CodeInterpreterToolParam;
 
 #[derive(Clone)]
-pub struct RemoteAgentRtExecutor {
+pub(crate) struct AgentRtExecutor {
     channel: Channel,
     config: AgentRtExecutorConfig,
     ledger: RemoteExecutionLedger,
@@ -48,10 +41,10 @@ pub(crate) enum WorkspaceResolution {
     Existing,
 }
 
-impl std::fmt::Debug for RemoteAgentRtExecutor {
+impl std::fmt::Debug for AgentRtExecutor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("RemoteAgentRtExecutor")
+            .debug_struct("AgentRtExecutor")
             .field("endpoint", &self.config.endpoint)
             .field("workspace_class_id", &self.config.workspace_class_id)
             .field("route_id", &self.config.route_id)
@@ -59,14 +52,14 @@ impl std::fmt::Debug for RemoteAgentRtExecutor {
     }
 }
 
-impl RemoteAgentRtExecutor {
+impl AgentRtExecutor {
     /// Builds the generated gRPC client over deployment-owned configuration.
     ///
     /// # Errors
     ///
     /// Returns [`ToolError::Config`] when the endpoint, workspace class, route,
     /// or signing key cannot satisfy the private execution contract.
-    pub fn new(config: AgentRtExecutorConfig, ledger: RemoteExecutionLedger) -> Result<Self, ToolError> {
+    pub(crate) fn new(config: AgentRtExecutorConfig, ledger: RemoteExecutionLedger) -> Result<Self, ToolError> {
         if config.endpoint.trim().is_empty()
             || config.workspace_class_id.trim().is_empty()
             || config.route_id.trim().is_empty()
@@ -89,40 +82,6 @@ impl RemoteAgentRtExecutor {
             ledger,
             workspace_locks: Arc::new(Mutex::new(HashMap::new())),
         })
-    }
-
-    async fn execute_remote(&self, context: GatewayExecutionContext, arguments: &str) -> Result<ToolOutput, ToolError> {
-        let args: CodeInterpreterArguments = serde_json::from_str(arguments)
-            .map_err(|error| ToolError::Config(format!("invalid code_interpreter arguments: {error}")))?;
-        if args.code.trim().is_empty() {
-            return Err(ToolError::Config(
-                "code_interpreter requires a non-empty code string".to_owned(),
-            ));
-        }
-        self.execute_commands(
-            context,
-            vec![RemoteCommand {
-                command: Command {
-                    argv: vec!["python".to_owned(), "-c".to_owned(), args.code],
-                    cwd: None,
-                    env: HashMap::new(),
-                    stdin: Vec::new(),
-                    artifact_paths: Vec::new(),
-                },
-                timeout: None,
-                max_output_bytes: None,
-            }],
-        )
-        .await
-    }
-
-    pub(crate) async fn execute_commands(
-        &self,
-        context: GatewayExecutionContext,
-        commands: Vec<RemoteCommand>,
-    ) -> Result<ToolOutput, ToolError> {
-        self.execute_commands_in_workspace(context, commands, WorkspaceResolution::CreateOrGet)
-            .await
     }
 
     pub(crate) async fn execute_commands_in_workspace(
@@ -615,123 +574,6 @@ impl Drop for RemoteCancelOnDrop {
     }
 }
 
-impl ToolHandler for RemoteAgentRtExecutor {
-    type ToolParams = CodeInterpreterToolParam;
-
-    fn tool_type(&self) -> ToolType {
-        ToolType::CodeInterpreter
-    }
-
-    fn validate(&self, _params: &Self::ToolParams) -> Result<(), ToolError> {
-        Ok(())
-    }
-
-    fn normalize(&self, _params: &Self::ToolParams) -> Vec<FunctionTool> {
-        vec![code_interpreter_function_tool()]
-    }
-}
-
-impl GatewayExecutor for RemoteAgentRtExecutor {
-    type ExecutionParams = CodeInterpreterToolParam;
-
-    fn execute(
-        &self,
-        _call_id: &str,
-        _tool_name: &str,
-        _arguments: &str,
-        _params: &Self::ExecutionParams,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        Box::pin(async {
-            Err(ToolError::Config(
-                "remote code_interpreter requires request execution context".to_owned(),
-            ))
-        })
-    }
-
-    fn execute_with_context(
-        &self,
-        context: GatewayExecutionContext,
-        _tool_name: &str,
-        arguments: &str,
-        _params: &Self::ExecutionParams,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let arguments = arguments.to_owned();
-        Box::pin(async move { self.execute_remote(context, &arguments).await })
-    }
-
-    fn supports_parallel_execution(&self) -> bool {
-        true
-    }
-
-    fn manages_execution_deadline(&self) -> bool {
-        true
-    }
-
-    fn public_outputs(
-        &self,
-        call: &FunctionToolCall,
-        output: &ToolOutput,
-        status: GatewayCallStatus,
-        _params: &Self::ExecutionParams,
-    ) -> Vec<OutputItem> {
-        let Ok(arguments) = serde_json::from_str::<CodeInterpreterArguments>(&call.arguments) else {
-            return Vec::new();
-        };
-        let Ok(records) = serde_json::from_str::<Vec<ExecutionOutcome>>(&output.output) else {
-            return Vec::new();
-        };
-        let Some(record) = records.into_iter().next() else {
-            return Vec::new();
-        };
-        let result = record.result.as_ref();
-        let mut logs = result.map_or_else(String::new, |result| result.stdout.clone());
-        if let Some(stderr) = result
-            .map(|result| result.stderr.as_str())
-            .filter(|value| !value.is_empty())
-        {
-            if !logs.is_empty() && !logs.ends_with('\n') {
-                logs.push('\n');
-            }
-            logs.push_str(stderr);
-        }
-        vec![OutputItem::CodeInterpreterCall(CodeInterpreterCall {
-            id: call.id.clone(),
-            code: arguments.code,
-            container_id: record.workspace_id,
-            outputs: (!logs.is_empty())
-                .then_some(CodeInterpreterOutput::Logs { logs })
-                .into_iter()
-                .collect(),
-            status: if status == GatewayCallStatus::Completed
-                && record.state == ExecutionOutcomeState::Completed
-                && result.is_some_and(|result| !result.is_error)
-            {
-                CodeInterpreterCallStatus::Completed
-            } else {
-                CodeInterpreterCallStatus::Failed
-            },
-        })]
-    }
-}
-
-#[must_use]
-pub(crate) fn code_interpreter_function_tool() -> FunctionTool {
-    FunctionTool {
-        type_: "function".to_owned(),
-        name: "code_interpreter".to_owned(),
-        description: Some("Execute Python code in an operator-managed sandbox.".to_owned()),
-        parameters: Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Python source code to execute."}
-            },
-            "required": ["code"],
-            "additionalProperties": false
-        })),
-        strict: Some(true),
-    }
-}
-
 async fn cancel_execution(
     channel: Channel,
     timeout: Duration,
@@ -896,12 +738,6 @@ fn unix_millis_u64() -> u64 {
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .unwrap_or_default()
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CodeInterpreterArguments {
-    code: String,
 }
 
 #[derive(Serialize)]

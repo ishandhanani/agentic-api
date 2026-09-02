@@ -21,15 +21,15 @@ use agent_rt_control::{
     ExecutionState, GetExecutionRequest, GetWorkspaceRequest, StartExecutionRequest, WatchExecutionRequest, Workspace,
     WorkspaceState,
 };
-use agentic_core::CodeInterpreterToolParam;
 use agentic_core::config::{AgentRtExecutorConfig, SubjectSigningKey};
 use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHandler, execute};
 use agentic_core::storage::{ConversationStore, RemoteExecutionLedger, ResponseStore, create_pool_with_schema};
 use agentic_core::tool::{
-    AuthenticatedSubject, GatewayExecutionContext, GatewayExecutor, RemoteAgentRtExecutor, TraceContext,
+    AgentRtShellExecutor, AuthenticatedSubject, GatewayExecutionContext, GatewayExecutor, TraceContext,
 };
 use agentic_core::types::io::{ResponsesInput, ToolChoice};
 use agentic_core::types::request_response::RequestPayload;
+use agentic_core::{ShellEnvironmentParam, ShellToolParam};
 use axum::Router;
 use axum::routing::post;
 use criterion::{Criterion, black_box, criterion_group};
@@ -225,6 +225,18 @@ fn remote_context(sequence: u64, subject: AuthenticatedSubject) -> GatewayExecut
     }
 }
 
+fn shell_tool() -> ShellToolParam {
+    ShellToolParam {
+        environment: Some(ShellEnvironmentParam::ContainerAuto {
+            file_ids: Vec::new(),
+            memory_limit: None,
+            network_policy: None,
+            skills: Vec::new(),
+        }),
+        allowed_callers: None,
+    }
+}
+
 fn integration_overhead(c: &mut Criterion) {
     let server_runtime = tokio::runtime::Runtime::new().unwrap();
     let dynamo_endpoint = start_dynamo_server(&server_runtime);
@@ -241,7 +253,7 @@ fn integration_overhead(c: &mut Criterion) {
     let remote_executor = {
         let _runtime_guard = setup_runtime.enter();
         Arc::new(
-            RemoteAgentRtExecutor::new(
+            AgentRtShellExecutor::new(
                 AgentRtExecutorConfig {
                     endpoint: agent_rt_endpoint,
                     workspace_class_id: "python.default".to_owned(),
@@ -307,12 +319,7 @@ fn integration_overhead(c: &mut Criterion) {
                 let context = remote_context(sequence.fetch_add(1, Ordering::Relaxed), subject);
                 black_box(
                     remote_executor
-                        .execute_with_context(
-                            context,
-                            "code_interpreter",
-                            r#"{"code":"print(42)"}"#,
-                            &CodeInterpreterToolParam::default(),
-                        )
+                        .execute_with_context(context, "shell", r#"{"commands":["printf 42"]}"#, &shell_tool())
                         .await
                         .unwrap(),
                 )

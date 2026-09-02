@@ -437,7 +437,7 @@ mod tests {
         }
 
         fn normalize(&self, _params: &Self::ToolParams) -> Vec<crate::types::io::FunctionTool> {
-            vec![crate::tool::code_interpreter::code_interpreter_function_tool()]
+            vec![crate::tool::normalize::code_interpreter_function_tool()]
         }
     }
 

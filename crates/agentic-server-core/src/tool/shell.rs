@@ -6,9 +6,7 @@ use std::time::Duration;
 use agent_rt_control::Command;
 use serde::Deserialize;
 
-use super::code_interpreter::{
-    ExecutionOutcome, ExecutionOutcomeState, RemoteAgentRtExecutor, RemoteCommand, WorkspaceResolution,
-};
+use super::agent_rt::{AgentRtExecutor, ExecutionOutcome, ExecutionOutcomeState, RemoteCommand, WorkspaceResolution};
 use super::{
     GatewayExecutionContext, GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput, ToolType,
 };
@@ -17,19 +15,26 @@ use crate::types::io::{
     ShellCallOutcome, ShellCallOutput, ShellCallOutputContent, ShellCallStatus,
 };
 use crate::types::tools::{ShellAllowedCallerParam, ShellEnvironmentParam, ShellToolParam};
+use crate::{config::AgentRtExecutorConfig, storage::RemoteExecutionLedger};
 
 const DEFAULT_MAX_OUTPUT_LENGTH: u64 = 4_096;
 const MAX_COMMANDS_PER_CALL: usize = 64;
 
 #[derive(Clone, Debug)]
-pub struct RemoteAgentRtShellExecutor {
-    inner: RemoteAgentRtExecutor,
+pub struct AgentRtShellExecutor {
+    inner: AgentRtExecutor,
 }
 
-impl RemoteAgentRtShellExecutor {
-    #[must_use]
-    pub const fn new(inner: RemoteAgentRtExecutor) -> Self {
-        Self { inner }
+impl AgentRtShellExecutor {
+    /// Builds the Shell executor over the private agent-rt control plane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Config`] when the agent-rt client configuration is invalid.
+    pub fn new(config: AgentRtExecutorConfig, ledger: RemoteExecutionLedger) -> Result<Self, ToolError> {
+        Ok(Self {
+            inner: AgentRtExecutor::new(config, ledger)?,
+        })
     }
 
     async fn execute_remote(
@@ -74,7 +79,7 @@ impl RemoteAgentRtShellExecutor {
     }
 }
 
-impl ToolHandler for RemoteAgentRtShellExecutor {
+impl ToolHandler for AgentRtShellExecutor {
     type ToolParams = ShellToolParam;
 
     fn tool_type(&self) -> ToolType {
@@ -119,7 +124,7 @@ impl ToolHandler for RemoteAgentRtShellExecutor {
     }
 }
 
-impl GatewayExecutor for RemoteAgentRtShellExecutor {
+impl GatewayExecutor for AgentRtShellExecutor {
     type ExecutionParams = ShellToolParam;
 
     fn execute(

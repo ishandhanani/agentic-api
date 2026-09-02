@@ -2,7 +2,6 @@ use crate::types::io::FunctionTool;
 use crate::types::io::input::FunctionToolResultMessage;
 use crate::types::tools::ResponsesTool;
 
-use super::code_interpreter::code_interpreter_function_tool;
 use super::codex::CodexNamespaceHandler;
 use super::custom::CustomHandler;
 use super::function::FunctionHandler;
@@ -87,6 +86,24 @@ impl ResponsesTool {
                 vec![]
             }
         }
+    }
+}
+
+#[must_use]
+pub(crate) fn code_interpreter_function_tool() -> FunctionTool {
+    FunctionTool {
+        type_: "function".to_owned(),
+        name: "code_interpreter".to_owned(),
+        description: Some("Execute Python code in an operator-managed sandbox.".to_owned()),
+        parameters: Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Python source code to execute."}
+            },
+            "required": ["code"],
+            "additionalProperties": false
+        })),
+        strict: Some(true),
     }
 }
 
