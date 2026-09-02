@@ -1083,6 +1083,16 @@ mod tests {
         server.abort();
     }
 
+    fn remove_sqlite_test_database(database_path: &std::path::Path) {
+        std::fs::remove_file(database_path).expect("remove restart test database");
+        for suffix in ["-shm", "-wal"] {
+            let sidecar = format!("{}{suffix}", database_path.display());
+            if std::path::Path::new(&sidecar).exists() {
+                std::fs::remove_file(sidecar).expect("remove SQLite restart sidecar");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn process_restart_reuses_durable_ledger_and_existing_remote_execution() {
         let subject = crate::tool::AuthenticatedSubject {
@@ -1095,8 +1105,7 @@ mod tests {
             Some("conv-restart"),
             "call-restart",
         );
-        let code = "print(42)";
-        let fingerprint = request_fingerprint("sandbox.python.default", &workspace_id, code);
+        let fingerprint = request_fingerprint("sandbox.python.default", &workspace_id, "print(42)");
         let database_path = std::env::temp_dir().join(format!("agentic-api-restart-{}.db", uuid::Uuid::now_v7()));
         let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
         let first_pool = crate::storage::create_pool_with_schema(Some(&database_url))
@@ -1180,13 +1189,7 @@ mod tests {
             .expect("recovered process persisted terminal state");
         assert_eq!(ledger_state, "completed");
         recovered_pool.close().await;
-        std::fs::remove_file(&database_path).expect("remove restart test database");
-        for suffix in ["-shm", "-wal"] {
-            let sidecar = format!("{}{suffix}", database_path.display());
-            if std::path::Path::new(&sidecar).exists() {
-                std::fs::remove_file(sidecar).expect("remove SQLite restart sidecar");
-            }
-        }
+        remove_sqlite_test_database(&database_path);
         server.abort();
     }
 }
