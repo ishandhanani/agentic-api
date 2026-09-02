@@ -464,6 +464,81 @@ async fn shell_reuses_referenced_agent_rt_workspace_and_projects_native_outputs(
 }
 
 #[tokio::test]
+async fn local_shell_round_trips_through_the_client_without_agent_rt_dispatch() {
+    let inference_state = InferenceState::default();
+    let (inference_url, inference_server) = serve_http(
+        axum::Router::new()
+            .route("/v1/responses", post(inference))
+            .with_state(inference_state.clone()),
+    )
+    .await;
+    let mut config = test_config(inference_url, "http://127.0.0.1:1".to_owned());
+    config.tools.agent_rt = None;
+    let exec_ctx = Arc::new(ExecutionContext::from_config(&config).await.expect("execution context"));
+    let first_request = serde_json::from_value(serde_json::json!({
+        "model": "test-model",
+        "input": "Run two shell commands locally.",
+        "store": true,
+        "stream": false,
+        "tools": [{"type": "shell", "environment": {"type": "local"}}]
+    }))
+    .expect("local shell request");
+
+    let Either::Left(first_response) = ExecuteRequest::new(first_request, Arc::clone(&exec_ctx))
+        .run()
+        .await
+        .expect("client-owned shell round")
+    else {
+        panic!("expected blocking response");
+    };
+    let [OutputItem::ShellCall(call)] = first_response.output.as_slice() else {
+        panic!("expected one client-owned native shell call");
+    };
+    assert_eq!(call.call_id, "call_shell_1");
+    assert!(matches!(call.environment, Some(ShellCallEnvironment::Local)));
+    assert_eq!(call.status, ShellCallStatus::InProgress);
+
+    let previous_response_id = first_response.id.clone();
+    let second_request = serde_json::from_value(serde_json::json!({
+        "model": "test-model",
+        "previous_response_id": previous_response_id,
+        "input": [
+            {
+                "type": "shell_call_output",
+                "call_id": call.call_id,
+                "max_output_length": call.action.max_output_length,
+                "output": [
+                    {"stdout": "first", "stderr": "", "outcome": {"type": "exit", "exit_code": 0}},
+                    {"stdout": "second", "stderr": "", "outcome": {"type": "exit", "exit_code": 0}}
+                ]
+            }
+        ],
+        "store": true,
+        "stream": false
+    }))
+    .expect("local shell continuation");
+
+    let Either::Left(second_response) = ExecuteRequest::new(second_request, Arc::clone(&exec_ctx))
+        .run()
+        .await
+        .expect("local shell continuation round")
+    else {
+        panic!("expected blocking response");
+    };
+    assert!(matches!(second_response.output.as_slice(), [OutputItem::Message(_)]));
+
+    let inference_requests = inference_state.requests.lock().await;
+    assert_eq!(inference_requests.len(), 2);
+    let continuation = inference_requests[1].to_string();
+    assert!(continuation.contains("function_call"));
+    assert!(continuation.contains("function_call_output"));
+    assert!(continuation.contains("call_shell_1"));
+    assert!(continuation.contains("first"));
+    assert!(!continuation.contains("shell_call_output"));
+    inference_server.abort();
+}
+
+#[tokio::test]
 async fn containers_catalog_maps_lifecycle_and_files_to_agent_rt() {
     let agent_rt_state = AgentRtState::default();
     let (agent_rt_url, agent_rt_server) = serve_agent_rt(agent_rt_state.clone()).await;

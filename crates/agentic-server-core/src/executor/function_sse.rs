@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -16,6 +16,13 @@ enum FunctionCallShape {
     PublicFunction,
     GatewayOwned,
     Custom(CustomCallState),
+    LocalShell(LocalShellCallState),
+}
+
+#[derive(Debug)]
+struct LocalShellCallState {
+    output_index: u32,
+    commands_emitted: bool,
 }
 
 #[derive(Debug)]
@@ -47,6 +54,7 @@ pub(super) struct FunctionSseTranslation {
 #[derive(Debug, Default)]
 pub(super) struct FunctionSseTranslator {
     tool_types: HashMap<String, ToolType>,
+    client_owned_names: HashSet<String>,
     active: HashMap<u32, FunctionCallShape>,
     pending_unnamed: HashMap<u32, PendingFunctionCall>,
     pending_bytes: usize,
@@ -59,6 +67,11 @@ impl FunctionSseTranslator {
             tool_types,
             ..Self::default()
         }
+    }
+
+    pub(super) fn with_client_owned_names(mut self, names: HashSet<String>) -> Self {
+        self.client_owned_names = names;
+        self
     }
 
     pub(super) fn translate(
@@ -142,6 +155,23 @@ impl FunctionSseTranslator {
                     defer_from_output_index: None,
                 })
             }
+            ToolType::Shell if self.client_owned_names.contains(name) => {
+                self.active.insert(
+                    output_index,
+                    FunctionCallShape::LocalShell(LocalShellCallState {
+                        output_index,
+                        commands_emitted: false,
+                    }),
+                );
+                Ok(FunctionSseTranslation {
+                    frames: call
+                        .map(|call| local_shell_added_frame(output_index, &call))
+                        .transpose()?
+                        .into_iter()
+                        .collect(),
+                    defer_from_output_index: None,
+                })
+            }
             ToolType::Mcp
             | ToolType::WebSearch
             | ToolType::FileSearch
@@ -175,7 +205,9 @@ impl FunctionSseTranslator {
                 frames: vec![original],
                 defer_from_output_index: None,
             }),
-            Some(FunctionCallShape::GatewayOwned) => Ok(FunctionSseTranslation::default()),
+            Some(FunctionCallShape::GatewayOwned | FunctionCallShape::LocalShell(_)) => {
+                Ok(FunctionSseTranslation::default())
+            }
             Some(FunctionCallShape::Custom(state)) => {
                 let frame = match call {
                     Some(call) => incremental_custom_delta(state, call.arguments())?,
@@ -202,6 +234,11 @@ impl FunctionSseTranslator {
         match self.active.get_mut(&output_index) {
             Some(FunctionCallShape::PublicFunction) | None => translated.frames.push(original),
             Some(FunctionCallShape::GatewayOwned) => {}
+            Some(FunctionCallShape::LocalShell(state)) => {
+                if let Some(call) = call {
+                    translated.frames.extend(finish_local_shell_commands(state, &call)?);
+                }
+            }
             Some(FunctionCallShape::Custom(state)) => {
                 if let Some(call) = call {
                     translated.frames.extend(finish_custom_input(state, call.arguments())?);
@@ -223,6 +260,14 @@ impl FunctionSseTranslator {
         match self.active.remove(&output_index) {
             Some(FunctionCallShape::PublicFunction) | None => translated.frames.push(original),
             Some(FunctionCallShape::GatewayOwned) => {}
+            Some(FunctionCallShape::LocalShell(mut state)) => {
+                if let Some(call) = call {
+                    translated
+                        .frames
+                        .extend(finish_local_shell_commands(&mut state, &call)?);
+                    translated.frames.push(local_shell_done_frame(&state, &call)?);
+                }
+            }
             Some(FunctionCallShape::Custom(mut state)) => {
                 if let Some(call) = call {
                     translated
@@ -307,6 +352,89 @@ impl FunctionSseTranslator {
         self.pending_bytes = self.pending_bytes.saturating_sub(pending.bytes);
         pending.frames
     }
+}
+
+fn local_shell_added_frame(output_index: u32, call: &AccumulatedFunctionCall<'_>) -> ExecutorResult<EventFrame> {
+    shell_frame(
+        SSEEventType::OutputItemAdded,
+        output_index,
+        [(
+            "item".to_owned(),
+            serde_json::json!({
+                "id": call.item.id,
+                "type": "shell_call",
+                "status": "in_progress",
+                "call_id": call.item.call_id,
+                "action": {"commands": []},
+                "environment": {"type": "local"},
+            }),
+        )],
+    )
+}
+
+fn finish_local_shell_commands(
+    state: &mut LocalShellCallState,
+    call: &AccumulatedFunctionCall<'_>,
+) -> ExecutorResult<Vec<EventFrame>> {
+    if state.commands_emitted {
+        return Ok(Vec::new());
+    }
+    ensure_function_call_size(call.arguments())?;
+    let Some(crate::types::io::OutputItem::ShellCall(shell_call)) = crate::tool::shell::client_shell_call(call.item)
+    else {
+        return Err(ExecutorError::StreamError(
+            "model emitted invalid local shell arguments".to_owned(),
+        ));
+    };
+    state.commands_emitted = true;
+    let mut frames = Vec::with_capacity(shell_call.action.commands.len().saturating_mul(2));
+    for (command_index, command) in shell_call.action.commands.into_iter().enumerate() {
+        let command_index = u64::try_from(command_index).unwrap_or(u64::MAX);
+        frames.push(shell_frame(
+            SSEEventType::ShellCallCommandAdded,
+            state.output_index,
+            [
+                ("command".to_owned(), Value::String(command.clone())),
+                ("command_index".to_owned(), Value::from(command_index)),
+            ],
+        )?);
+        frames.push(shell_frame(
+            SSEEventType::ShellCallCommandDone,
+            state.output_index,
+            [
+                ("command".to_owned(), Value::String(command)),
+                ("command_index".to_owned(), Value::from(command_index)),
+            ],
+        )?);
+    }
+    Ok(frames)
+}
+
+fn local_shell_done_frame(
+    state: &LocalShellCallState,
+    call: &AccumulatedFunctionCall<'_>,
+) -> ExecutorResult<EventFrame> {
+    let Some(item) = crate::tool::shell::client_shell_call(call.item) else {
+        return Err(ExecutorError::StreamError(
+            "model emitted invalid local shell arguments".to_owned(),
+        ));
+    };
+    let item = serde_json::to_value(item).map_err(ExecutorError::JsonError)?;
+    shell_frame(
+        SSEEventType::OutputItemDone,
+        state.output_index,
+        [("item".to_owned(), item)],
+    )
+}
+
+fn shell_frame(
+    event_type: SSEEventType,
+    output_index: u32,
+    fields: impl IntoIterator<Item = (String, Value)>,
+) -> ExecutorResult<EventFrame> {
+    let mut frame = synthetic_event(event_type, fields)?;
+    frame.wire.output_index = Some(u64::from(output_index));
+    Ok(frame)
 }
 
 fn custom_added_frame(call: &AccumulatedFunctionCall<'_>) -> ExecutorResult<EventFrame> {
@@ -530,6 +658,62 @@ mod tests {
             .process_sse_line_with_translator(&sse(value), translator)
             .expect("translation succeeds")
             .expect("SSE event")
+    }
+
+    #[test]
+    fn client_owned_shell_stream_restores_native_command_events() {
+        let mut accumulator = ResponseAccumulator::new("resp_1".to_owned(), None);
+        let mut translator = FunctionSseTranslator::new(HashMap::from([("shell".to_owned(), ToolType::Shell)]))
+            .with_client_owned_names(HashSet::from(["shell".to_owned()]));
+        let arguments = r#"{"commands":["printf first","printf second"],"max_output_length":1024}"#;
+        let events = [
+            serde_json::json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "fc_shell", "type": "function_call", "call_id": "call_shell",
+                    "name": "shell", "arguments": "", "status": "in_progress"}
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta", "output_index": 0,
+                "item_id": "fc_shell", "call_id": "call_shell", "delta": arguments
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.done", "output_index": 0,
+                "item_id": "fc_shell", "call_id": "call_shell", "name": "shell", "arguments": arguments
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"id": "fc_shell", "type": "function_call", "call_id": "call_shell",
+                    "name": "shell", "arguments": arguments, "status": "completed"}
+            }),
+        ];
+
+        let frames = events
+            .iter()
+            .flat_map(|event| translate(&mut accumulator, &mut translator, event).frames)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            frames.iter().map(|frame| frame.event_type).collect::<Vec<_>>(),
+            [
+                SSEEventType::OutputItemAdded,
+                SSEEventType::ShellCallCommandAdded,
+                SSEEventType::ShellCallCommandDone,
+                SSEEventType::ShellCallCommandAdded,
+                SSEEventType::ShellCallCommandDone,
+                SSEEventType::OutputItemDone,
+            ]
+        );
+        assert_eq!(frames[0].wire.rest["item"]["type"], "shell_call");
+        assert_eq!(frames[0].wire.rest["item"]["environment"]["type"], "local");
+        assert_eq!(frames[1].wire.rest["command"], "printf first");
+        assert_eq!(frames[3].wire.rest["command_index"], 1);
+        assert_eq!(
+            frames[5].wire.rest["item"]["action"]["commands"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(frames[5].wire.rest["item"]["status"], "in_progress");
     }
 
     #[test]

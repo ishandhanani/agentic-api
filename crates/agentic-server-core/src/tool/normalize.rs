@@ -48,7 +48,14 @@ impl ResponsesTool {
 
     #[must_use]
     pub fn is_gateway_owned(&self) -> bool {
-        self.tool_type().is_some_and(ToolType::is_gateway_owned)
+        match self {
+            Self::Mcp(_) | Self::WebSearch(_) | Self::FileSearch(_) | Self::CodeInterpreter(_) => true,
+            Self::Shell(params) => !matches!(
+                params.environment,
+                Some(crate::types::tools::ShellEnvironmentParam::Local { .. })
+            ),
+            Self::Function(_) | Self::Namespace(_) | Self::Custom(_) | Self::Unknown => false,
+        }
     }
 
     /// Normalise function-like tool declarations to the `FunctionTool` wire format that vLLM understands.

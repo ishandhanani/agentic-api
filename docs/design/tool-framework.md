@@ -27,7 +27,7 @@ The original implementation used `ResponsesTool = FunctionTool`. The shipped typ
 1. **One pipeline, many types.** The tool lifecycle is the same for all types. What varies is the behavior at each stage.
 2. **vLLM is function-only.** Model-visible declarations normalize to `type: "function"` before inference. Types without a model-facing implementation are omitted; public tool identity is restored after inference.
 3. **Routing by registry, not heuristics.** After inference, `function_call` items are looked up in a request-scoped registry that maps names back to origin type and config.
-4. **Ownership decides execution.** Each registry entry has explicit `ToolOwnership`; `ToolType::is_gateway_owned()` supplies the declaration-level default. Client-owned types (`function`, `custom`, `codex namespace`) are never gateway-executed — their calls are returned for the client to resolve. Gateway-owned types (`web_search`, `mcp`, `file_search`, `code_interpreter`) are handled by the gateway. Web search and MCP ship executable bindings; a gateway-owned entry without an implementation produces an error tool result for the next inference round rather than silently dropping the call.
+4. **Ownership decides execution.** Each request-scoped registry entry has explicit `ToolOwnership`; ownership is derived from the full declaration, not only its type tag. Client-owned tools are returned for the caller to resolve. Gateway-owned tools are handled by the gateway. Native Shell demonstrates why ownership belongs on the entry: `environment.type=local` is client-owned, while `container_auto` and `container_reference` are gateway-owned and execute through agent-rt.
 5. **Additive.** New tool types implement a trait and register. The executor loop doesn't change.
 
 ---
@@ -112,20 +112,16 @@ pub enum ToolType {
                       // while the wire tag is "web_search_preview".
     FileSearch,
     CodeInterpreter,
-}
-
-impl ToolType {
-    /// Gateway-owned types are handled server-side; everything else
-    /// (`Function`, `Custom`, `CodexNamespace`) is client-owned and handed back.
-    pub const fn is_gateway_owned(self) -> bool { /* ... */ }
+    Shell,
 }
 ```
 
 > **Drift from proposal:** `CodexNamespace` did not exist in the original
 > sketch. Codex declares tools grouped under a namespace whose members are
 > client-owned; they flatten to model-visible names for inference and restore
-> to `{namespace, name}` on the way out. `is_gateway_owned()` initializes entry
-> ownership; routing uses the explicit `ToolOwnership` stored on that entry.
+> to `{namespace, name}` on the way out. Routing uses the explicit
+> `ToolOwnership` stored on each request-scoped entry. This also permits one
+> public tool type, such as Shell, to have different owners based on its declaration.
 
 ### Request-Side Tool Param
 
@@ -365,18 +361,18 @@ through `started_output` and `public_output`.
 
 ## Per-Type Behavior
 
-| Stage | `function` | `custom` | `codex namespace` | `mcp` | `web_search` | `file_search` | `code_interpreter` |
-|-------|------------|----------|-------------------|-------|--------------|---------------|--------------------|
-| Validate | name required | name and supported format | member names required | server identity, policy, and allowed tools | typed configuration | vector_store_ids required | typed configuration |
-| Discover | no-op | no-op | no-op | `tools/list` on server | no-op | no-op | no-op |
-| Normalize | passthrough | freeform input → function parameter | flatten members → `FunctionTool` | discovered schema → `FunctionTool` | synthetic `web_search(query)` | omitted (not implemented) | omitted (not implemented) |
-| Route | → client | → client (restore custom shape) | → client (restore `{namespace, name}`) | → gateway binding | → gateway binding | → gateway without binding | → gateway without binding |
-| Execute | N/A | N/A | N/A | JSON-RPC `tools/call` | HTTP search API | error tool result if called | error tool result if called |
-| SSE events | upstream function-call lifecycle | restored custom-call lifecycle | restored namespace call lifecycle | gateway-generated `mcp_call.*` | gateway-generated `web_search_call.*` | none | none |
-| Call handling | returned to client | returned to client | returned to client | gateway executes | gateway executes | error tool result (no handler yet) | error tool result (no handler yet) |
+| Stage | `function` | `custom` | `codex namespace` | `mcp` | `web_search` | `shell` |
+|-------|------------|----------|-------------------|-------|--------------|---------|
+| Validate | name required | name and supported format | member names required | server identity, policy, and allowed tools | typed configuration | typed environment; normalized path supports direct callers |
+| Discover | no-op | no-op | no-op | `tools/list` on server | no-op | no-op |
+| Normalize | passthrough | freeform input → function parameter | flatten members → `FunctionTool` | discovered schema → `FunctionTool` | synthetic `web_search(query)` | synthetic `shell(commands, timeout_ms, max_output_length)` |
+| Route | → client | → client (restore custom shape) | → client (restore `{namespace, name}`) | → gateway binding | → gateway binding | local → client; container → agent-rt binding |
+| Execute | N/A | N/A | N/A | JSON-RPC `tools/call` | HTTP search API | caller runtime or agent-rt workspace |
+| SSE events | upstream function-call lifecycle | restored custom-call lifecycle | restored namespace call lifecycle | gateway-generated `mcp_call.*` | gateway-generated `web_search_call.*` | native `shell_call` and command lifecycle |
+| Call handling | returned to client | returned to client | returned to client | gateway executes | gateway executes | local returns for `shell_call_output`; container loops server-side |
 
-`codex namespace`, `web_search`, and `mcp` ship today; `file_search` /
-`code_interpreter` are declared gateway-owned `ToolType`s without executors yet.
+`codex namespace`, `web_search`, `mcp`, and both Shell ownership paths ship today. `file_search` and
+`code_interpreter` remain declared gateway-owned types without executors.
 
 ---
 

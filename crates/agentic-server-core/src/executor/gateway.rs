@@ -444,6 +444,9 @@ pub(super) fn public_output_items(
             OutputItem::FunctionCall(call) if registry.is_client_custom_name(&call.name) => {
                 vec![crate::tool::CustomHandler::output_item(call)]
             }
+            OutputItem::FunctionCall(call) if registry.is_client_shell_name(&call.name) => {
+                crate::tool::shell::client_shell_call(call).map_or_else(|| vec![item.clone()], |call| vec![call])
+            }
             OutputItem::FunctionCall(call) if registry.is_gateway_owned_name(&call.name) => gateway_results
                 .iter()
                 .find(|result| result.item_index == item_index)

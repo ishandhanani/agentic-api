@@ -95,15 +95,7 @@ impl ToolHandler for AgentRtShellExecutor {
     }
 
     fn validate(&self, params: &Self::ToolParams) -> Result<(), ToolError> {
-        if params
-            .allowed_callers
-            .as_ref()
-            .is_some_and(|callers| callers.iter().any(|caller| *caller != ShellAllowedCallerParam::Direct))
-        {
-            return Err(ToolError::Config(
-                "agent-rt shell does not support programmatic callers".to_owned(),
-            ));
-        }
+        validate_direct_callers(params)?;
         match &params.environment {
             Some(ShellEnvironmentParam::ContainerReference { container_id }) if container_id.trim().is_empty() => Err(
                 ToolError::Config("container_reference requires a container_id".to_owned()),
@@ -130,6 +122,23 @@ impl ToolHandler for AgentRtShellExecutor {
     fn normalize(&self, _params: &Self::ToolParams) -> Vec<FunctionTool> {
         vec![shell_function_tool()]
     }
+}
+
+pub(crate) fn validate_client_shell(params: &ShellToolParam) -> Result<(), ToolError> {
+    validate_direct_callers(params)
+}
+
+fn validate_direct_callers(params: &ShellToolParam) -> Result<(), ToolError> {
+    if params
+        .allowed_callers
+        .as_ref()
+        .is_some_and(|callers| callers.iter().any(|caller| *caller != ShellAllowedCallerParam::Direct))
+    {
+        return Err(ToolError::Config(
+            "normalized shell supports only direct callers".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 impl GatewayExecutor for AgentRtShellExecutor {
@@ -242,6 +251,17 @@ fn shell_call(
         environment,
         status,
     })
+}
+
+#[must_use]
+pub(crate) fn client_shell_call(call: &FunctionToolCall) -> Option<OutputItem> {
+    let action = parse_action(&call.arguments).ok()?;
+    Some(shell_call(
+        call,
+        &action,
+        Some(ShellCallEnvironment::Local),
+        ShellCallStatus::InProgress,
+    ))
 }
 
 fn shell_error_message(output: &str) -> String {

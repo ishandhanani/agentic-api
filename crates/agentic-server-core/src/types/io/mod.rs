@@ -5,8 +5,8 @@ pub mod usage;
 
 pub use input::{
     CompactionItem, CustomToolCallOutputMessage, FunctionToolResultMessage, InputContent, InputFileContent,
-    InputFunctionToolCall, InputImageContent, InputItem, InputMessage, InputMessageContent, InputTextContent,
-    ResponsesInput, ToolCallOutput, ToolOutputContent,
+    InputFunctionToolCall, InputImageContent, InputItem, InputMessage, InputMessageContent, InputShellCall,
+    InputTextContent, ResponsesInput, ShellCallOutputMessage, ToolCallOutput, ToolOutputContent,
 };
 pub use output::{
     ApplyDone, CodeInterpreterCall, CodeInterpreterCallStatus, CodeInterpreterOutput, CustomToolCall, FunctionToolCall,

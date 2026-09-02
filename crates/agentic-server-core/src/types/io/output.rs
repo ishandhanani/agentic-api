@@ -945,9 +945,9 @@ impl OutputItem {
             Self::CustomToolCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
             Self::McpListTools(list_tools) => Some(InputItem::McpListTools(list_tools.clone())),
             Self::Compaction(item) => Some(InputItem::Compaction(item.clone())),
+            Self::ShellCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
             Self::WebSearchCall(_)
             | Self::CodeInterpreterCall(_)
-            | Self::ShellCall(_)
             | Self::ShellCallOutput(_)
             | Self::McpCall(_)
             | Self::Unknown => None,
