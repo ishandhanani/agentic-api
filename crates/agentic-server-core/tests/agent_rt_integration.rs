@@ -108,8 +108,24 @@ impl WorkspaceService for AgentRtState {
         }))
     }
 
-    async fn get_workspace(&self, _request: Request<GetWorkspaceRequest>) -> Result<Response<Workspace>, Status> {
-        Err(Status::unimplemented("not needed by this integration test"))
+    async fn get_workspace(&self, request: Request<GetWorkspaceRequest>) -> Result<Response<Workspace>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        Ok(Response::new(Workspace {
+            workspace_id: request.workspace_id,
+            workspace_class_id: "python.default".to_owned(),
+            workspace_class_revision: "python.default@sha256:test".to_owned(),
+            state: WorkspaceState::Ready as i32,
+            revision: 1,
+            created_at_unix_millis: 1,
+            last_active_at_unix_millis: 1,
+            expires_at_unix_millis: None,
+            capabilities: vec![Capability {
+                name: "command.execute".to_owned(),
+                version: 1,
+            }],
+            failure_code: None,
+        }))
     }
 
     async fn delete_workspace(&self, _request: Request<DeleteWorkspaceRequest>) -> Result<Response<Workspace>, Status> {
@@ -236,7 +252,7 @@ fn test_config(inference_url: String, agent_rt_url: String) -> Config {
 }
 
 #[tokio::test]
-async fn shell_uses_one_agent_rt_workspace_and_projects_native_outputs() {
+async fn shell_reuses_referenced_agent_rt_workspace_and_projects_native_outputs() {
     let inference_state = InferenceState::default();
     let (inference_url, inference_server) = serve_http(
         axum::Router::new()
@@ -256,7 +272,10 @@ async fn shell_uses_one_agent_rt_workspace_and_projects_native_outputs() {
         "input": "Run two shell commands.",
         "store": false,
         "stream": false,
-        "tools": [{"type": "shell", "environment": {"type": "container_auto"}}]
+        "tools": [{"type": "shell", "environment": {
+            "type": "container_reference",
+            "container_id": "cntr_existing"
+        }}]
     }))
     .expect("request payload");
 
@@ -281,9 +300,9 @@ async fn shell_uses_one_agent_rt_workspace_and_projects_native_outputs() {
     assert_eq!(call.action.commands, ["printf first", "printf second"]);
     assert_eq!(call.status, ShellCallStatus::Completed);
     let Some(ShellCallEnvironment::ContainerReference { container_id }) = &call.environment else {
-        panic!("container_auto must project the agent-rt workspace");
+        panic!("shell must project the referenced agent-rt workspace");
     };
-    assert!(container_id.starts_with("ws_"));
+    assert_eq!(container_id, "cntr_existing");
     assert_eq!(output.call_id, "call_shell_1");
     assert_eq!(output.status, ShellCallStatus::Completed);
     assert_eq!(output.output.len(), 2);
@@ -308,8 +327,7 @@ async fn shell_uses_one_agent_rt_workspace_and_projects_native_outputs() {
     assert!(!reinjected.contains("previous_response_id"));
 
     let workspace_requests = agent_rt_state.workspace_requests.lock().await;
-    assert_eq!(workspace_requests.len(), 1);
-    assert_eq!(workspace_requests[0].workspace_class_id, "python.default");
+    assert!(workspace_requests.is_empty());
     let execution_requests = agent_rt_state.execution_requests.lock().await;
     assert_eq!(execution_requests.len(), 2);
     assert!(
@@ -318,6 +336,7 @@ async fn shell_uses_one_agent_rt_workspace_and_projects_native_outputs() {
             .all(|request| request.route_id == "sandbox.python.default")
     );
     assert_eq!(execution_requests[0].workspace_id, execution_requests[1].workspace_id);
+    assert_eq!(execution_requests[0].workspace_id, "cntr_existing");
     assert_ne!(execution_requests[0].execution_id, execution_requests[1].execution_id);
     assert_eq!(
         execution_requests[0].command.as_ref().expect("command").argv,

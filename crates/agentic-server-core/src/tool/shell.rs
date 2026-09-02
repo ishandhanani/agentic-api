@@ -6,7 +6,9 @@ use std::time::Duration;
 use agent_rt_control::Command;
 use serde::Deserialize;
 
-use super::code_interpreter::{ExecutionOutcome, ExecutionOutcomeState, RemoteAgentRtExecutor, RemoteCommand};
+use super::code_interpreter::{
+    ExecutionOutcome, ExecutionOutcomeState, RemoteAgentRtExecutor, RemoteCommand, WorkspaceResolution,
+};
 use super::{
     GatewayExecutionContext, GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput, ToolType,
 };
@@ -30,7 +32,12 @@ impl RemoteAgentRtShellExecutor {
         Self { inner }
     }
 
-    async fn execute_remote(&self, context: GatewayExecutionContext, arguments: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute_remote(
+        &self,
+        mut context: GatewayExecutionContext,
+        arguments: &str,
+        params: &ShellToolParam,
+    ) -> Result<ToolOutput, ToolError> {
         let action = parse_action(arguments)?;
         let timeout = action.timeout_ms.map(Duration::from_millis);
         let max_output_bytes = Some(action.max_output_length.unwrap_or(DEFAULT_MAX_OUTPUT_LENGTH));
@@ -49,7 +56,21 @@ impl RemoteAgentRtShellExecutor {
                 max_output_bytes,
             })
             .collect();
-        self.inner.execute_commands(context, commands).await
+        let workspace_resolution = match &params.environment {
+            Some(ShellEnvironmentParam::ContainerReference { container_id }) => {
+                container_id.clone_into(&mut context.workspace_id);
+                WorkspaceResolution::Existing
+            }
+            None | Some(ShellEnvironmentParam::ContainerAuto { .. }) => WorkspaceResolution::CreateOrGet,
+            Some(ShellEnvironmentParam::Local { .. }) => {
+                return Err(ToolError::Config(
+                    "environment.local is client-executed and cannot be handled by agent-rt".to_owned(),
+                ));
+            }
+        };
+        self.inner
+            .execute_commands_in_workspace(context, commands, workspace_resolution)
+            .await
     }
 }
 
@@ -71,7 +92,10 @@ impl ToolHandler for RemoteAgentRtShellExecutor {
             ));
         }
         match &params.environment {
-            None => Ok(()),
+            Some(ShellEnvironmentParam::ContainerReference { container_id }) if container_id.trim().is_empty() => Err(
+                ToolError::Config("container_reference requires a container_id".to_owned()),
+            ),
+            None | Some(ShellEnvironmentParam::ContainerReference { .. }) => Ok(()),
             Some(ShellEnvironmentParam::ContainerAuto {
                 file_ids,
                 memory_limit,
@@ -86,9 +110,6 @@ impl ToolHandler for RemoteAgentRtShellExecutor {
             )),
             Some(ShellEnvironmentParam::Local { .. }) => Err(ToolError::Config(
                 "environment.local is client-executed and cannot be handled by agent-rt".to_owned(),
-            )),
-            Some(ShellEnvironmentParam::ContainerReference { .. }) => Err(ToolError::Config(
-                "container_reference requires the agent-rt-backed Containers API".to_owned(),
             )),
         }
     }
@@ -120,10 +141,11 @@ impl GatewayExecutor for RemoteAgentRtShellExecutor {
         context: GatewayExecutionContext,
         _tool_name: &str,
         arguments: &str,
-        _params: &Self::ExecutionParams,
+        params: &Self::ExecutionParams,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
         let arguments = arguments.to_owned();
-        Box::pin(async move { self.execute_remote(context, &arguments).await })
+        let params = params.clone();
+        Box::pin(async move { self.execute_remote(context, &arguments, &params).await })
     }
 
     fn manages_execution_deadline(&self) -> bool {

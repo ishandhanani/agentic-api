@@ -8,7 +8,7 @@ use agent_rt_control::execution_service_client::ExecutionServiceClient;
 use agent_rt_control::workspace_service_client::WorkspaceServiceClient;
 use agent_rt_control::{
     CancelExecutionRequest, Command, CreateWorkspaceRequest, Execution, ExecutionLimits, ExecutionState,
-    GetExecutionRequest, StartExecutionRequest, WatchExecutionRequest, WorkspaceState,
+    GetExecutionRequest, GetWorkspaceRequest, StartExecutionRequest, WatchExecutionRequest, Workspace, WorkspaceState,
 };
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -40,6 +40,12 @@ pub(crate) struct RemoteCommand {
     pub command: Command,
     pub timeout: Option<Duration>,
     pub max_output_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceResolution {
+    CreateOrGet,
+    Existing,
 }
 
 impl std::fmt::Debug for RemoteAgentRtExecutor {
@@ -115,6 +121,16 @@ impl RemoteAgentRtExecutor {
         context: GatewayExecutionContext,
         commands: Vec<RemoteCommand>,
     ) -> Result<ToolOutput, ToolError> {
+        self.execute_commands_in_workspace(context, commands, WorkspaceResolution::CreateOrGet)
+            .await
+    }
+
+    pub(crate) async fn execute_commands_in_workspace(
+        &self,
+        context: GatewayExecutionContext,
+        commands: Vec<RemoteCommand>,
+        workspace_resolution: WorkspaceResolution,
+    ) -> Result<ToolOutput, ToolError> {
         if commands.is_empty() {
             return Err(ToolError::Config("agent-rt requires at least one command".to_owned()));
         }
@@ -141,6 +157,7 @@ impl RemoteAgentRtExecutor {
                 response_id: &context.response_id,
                 conversation_id: context.conversation_id.as_deref(),
                 call_id: &context.call_id,
+                workspace_id: &context.workspace_id,
                 route_id: &self.config.route_id,
                 request_fingerprint: &request_fingerprint,
                 absolute_deadline: proposed_deadline,
@@ -153,9 +170,18 @@ impl RemoteAgentRtExecutor {
             ));
         }
         let token = self.sign_subject(&link)?;
-        self.create_workspace(&link, &token, context.trace_context.traceparent.as_deref())
-            .await
-            .map_err(remote_error)?;
+        match workspace_resolution {
+            WorkspaceResolution::CreateOrGet => {
+                self.create_workspace(&link, &token, context.trace_context.traceparent.as_deref())
+                    .await
+                    .map_err(remote_error)?;
+            }
+            WorkspaceResolution::Existing => {
+                self.get_workspace(&link, &token, context.trace_context.traceparent.as_deref())
+                    .await
+                    .map_err(remote_error)?;
+            }
+        }
 
         let command_count = commands.len();
         let mut outcomes = Vec::with_capacity(command_count);
@@ -294,17 +320,29 @@ impl RemoteAgentRtExecutor {
             Err(RemoteTransportError::Ambiguous(_)) => execute().await?,
             Err(error) => return Err(error),
         };
-        match WorkspaceState::try_from(workspace.state) {
-            Ok(WorkspaceState::Ready) => Ok(()),
-            Ok(state) => Err(RemoteTransportError::Rejected {
-                code: Code::FailedPrecondition,
-                message: format!("workspace is not ready: {}", state.as_str_name()),
-            }),
-            Err(_) => Err(RemoteTransportError::Rejected {
-                code: Code::Internal,
-                message: "workspace returned an unknown lifecycle state".to_owned(),
-            }),
-        }
+        validate_ready_workspace(&workspace, &self.config.workspace_class_id)
+    }
+
+    async fn get_workspace(
+        &self,
+        link: &RemoteExecutionLink,
+        token: &str,
+        traceparent: Option<&str>,
+    ) -> Result<(), RemoteTransportError> {
+        let request = grpc_request(
+            GetWorkspaceRequest {
+                workspace_id: link.workspace_id.clone(),
+            },
+            token,
+            self.config.transport_timeout,
+            traceparent,
+        )?;
+        let workspace = WorkspaceServiceClient::new(self.channel.clone())
+            .get_workspace(request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| classify_status(&status))?;
+        validate_ready_workspace(&workspace, &self.config.workspace_class_id)
     }
 
     async fn start_or_recover(
@@ -510,6 +548,29 @@ impl RemoteAgentRtExecutor {
         mac.update(payload.as_bytes());
         let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
         Ok(format!("{payload}.{signature}"))
+    }
+}
+
+fn validate_ready_workspace(workspace: &Workspace, expected_class_id: &str) -> Result<(), RemoteTransportError> {
+    if workspace.workspace_class_id != expected_class_id {
+        return Err(RemoteTransportError::Rejected {
+            code: Code::FailedPrecondition,
+            message: format!(
+                "workspace class mismatch: expected {expected_class_id}, got {}",
+                workspace.workspace_class_id
+            ),
+        });
+    }
+    match WorkspaceState::try_from(workspace.state) {
+        Ok(WorkspaceState::Ready) => Ok(()),
+        Ok(state) => Err(RemoteTransportError::Rejected {
+            code: Code::FailedPrecondition,
+            message: format!("workspace is not ready: {}", state.as_str_name()),
+        }),
+        Err(_) => Err(RemoteTransportError::Rejected {
+            code: Code::Internal,
+            message: "workspace returned an unknown lifecycle state".to_owned(),
+        }),
     }
 }
 
