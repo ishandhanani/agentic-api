@@ -11,8 +11,8 @@ use crate::storage::{
     ConversationStore, ConversationVersion, DatabaseBackend, ResponseStore, create_pool_with_schema_and_configs,
 };
 use crate::tool::AuthenticatedSubject;
-use crate::tool::agent_rt::AgentRtClient;
-use crate::tool::{AgentRtShellExecutor, GatewayExecutorRegistration, GatewayExecutors};
+use crate::tool::shed::ShedClient;
+use crate::tool::{GatewayExecutorRegistration, GatewayExecutors, ShedShellExecutor};
 use crate::types::io::InputItem;
 use crate::types::messages::GatewayToolMap;
 use crate::types::request_response::{RequestPayload, ResponsePayload};
@@ -154,7 +154,7 @@ impl ExecutionContext {
         Some(subject)
     }
 
-    /// Returns the configured `OpenAI` Containers adapter over agent-rt.
+    /// Returns the configured `OpenAI` Containers adapter over shed.
     #[must_use]
     pub fn container_service(&self) -> Option<&ContainerService> {
         self.container_service.as_ref()
@@ -191,10 +191,10 @@ impl ExecutionContext {
         let mut gateway_executors = GatewayExecutors::from_config(Arc::clone(&client), &cfg.tools)
             .map_err(|error| Error::Config(format!("failed to validate configured tool executors: {error}")))?;
         let mut container_service = None;
-        if let Some(agent_rt) = cfg.tools.agent_rt.clone() {
-            let client = AgentRtClient::new(agent_rt)
-                .map_err(|error| Error::Config(format!("failed to configure agent-rt client: {error}")))?;
-            let executor = AgentRtShellExecutor::from_client(
+        if let Some(shed) = cfg.tools.shed.clone() {
+            let client = ShedClient::new(shed)
+                .map_err(|error| Error::Config(format!("failed to configure shed client: {error}")))?;
+            let executor = ShedShellExecutor::from_client(
                 client.clone(),
                 crate::storage::RemoteExecutionLedger::new(pool.clone()),
             );
@@ -218,21 +218,20 @@ impl ExecutionContext {
                 .unwrap_or_default(),
             llm_base_url: cfg.llm_api_base.clone(),
             streaming_timeout: streaming_timeout_from_env(),
-            gateway_scheduler_policy: cfg.tools.agent_rt.as_ref().map_or_else(
+            gateway_scheduler_policy: cfg.tools.shed.as_ref().map_or_else(
                 || GatewaySchedulerPolicy::new(cfg.tools.max_concurrent_gateway_calls),
-                |agent_rt| {
+                |shed| {
                     GatewaySchedulerPolicy::with_timeouts(
                         cfg.tools.max_concurrent_gateway_calls,
-                        agent_rt.execution_timeout,
-                        agent_rt
-                            .execution_timeout
-                            .saturating_add(agent_rt.transport_timeout)
-                            .saturating_add(agent_rt.lookup_wait),
+                        shed.execution_timeout,
+                        shed.execution_timeout
+                            .saturating_add(shed.transport_timeout)
+                            .saturating_add(shed.lookup_wait),
                     )
                 },
             ),
             storage_pool: Some(pool),
-            remote_default_subject: cfg.tools.agent_rt.as_ref().map(|config| AuthenticatedSubject {
+            remote_default_subject: cfg.tools.shed.as_ref().map(|config| AuthenticatedSubject {
                 tenant_id: config.tenant_id.clone(),
                 principal_id: config.default_principal_id.clone(),
             }),

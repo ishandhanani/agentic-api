@@ -15,7 +15,7 @@ exclude = [
 name = "agentic_core"
 
 [dependencies]
-agent-rt-control.workspace = true
+shed-control.workspace = true
 async-stream.workspace = true
 base64.workspace = true
 blake3.workspace = true

@@ -2,39 +2,39 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agent_rt_control::execution_service_client::ExecutionServiceClient;
-use agent_rt_control::workspace_file_service_client::WorkspaceFileServiceClient;
-use agent_rt_control::workspace_service_client::WorkspaceServiceClient;
-use agent_rt_control::{
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use shed_control::execution_service_client::ExecutionServiceClient;
+use shed_control::workspace_file_service_client::WorkspaceFileServiceClient;
+use shed_control::workspace_service_client::WorkspaceServiceClient;
+use shed_control::{
     CancelExecutionRequest, Command, CreateWorkspaceRequest, DeleteWorkspaceRequest, Execution, ExecutionLimits,
     ExecutionState, FileChunk, FileMetadata, GetExecutionRequest, GetWorkspaceRequest, ReadFileRequest,
     RemoveFileRequest, StartExecutionRequest, StatFileRequest, WatchExecutionRequest, Workspace, WorkspaceState,
     WriteFileRequest,
 };
-use base64::Engine;
-use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 
 use super::{AuthenticatedSubject, GatewayExecutionContext, ToolError, ToolOutput};
-use crate::config::AgentRtExecutorConfig;
+use crate::config::ShedExecutorConfig;
 use crate::storage::{ClaimRemoteExecution, RemoteExecutionLedger, RemoteExecutionLink};
 
 #[derive(Clone)]
-pub(crate) struct AgentRtExecutor {
-    client: AgentRtClient,
+pub(crate) struct ShedExecutor {
+    client: ShedClient,
     ledger: RemoteExecutionLedger,
     workspace_locks: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
 }
 
 #[derive(Clone)]
-pub(crate) struct AgentRtClient {
+pub(crate) struct ShedClient {
     channel: Channel,
-    config: AgentRtExecutorConfig,
+    config: ShedExecutorConfig,
 }
 
 pub(crate) struct RemoteFileWrite {
@@ -55,40 +55,38 @@ pub(crate) enum WorkspaceResolution {
     Existing,
 }
 
-impl std::fmt::Debug for AgentRtExecutor {
+impl std::fmt::Debug for ShedExecutor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("AgentRtExecutor")
+            .debug_struct("ShedExecutor")
             .field("endpoint", &self.client.config.endpoint)
-            .field("workspace_class_id", &self.client.config.workspace_class_id)
-            .field("route_id", &self.client.config.route_id)
+            .field("profile_id", &self.client.config.profile_id)
             .finish_non_exhaustive()
     }
 }
 
-impl std::fmt::Debug for AgentRtClient {
+impl std::fmt::Debug for ShedClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("AgentRtClient")
+            .debug_struct("ShedClient")
             .field("endpoint", &self.config.endpoint)
-            .field("workspace_class_id", &self.config.workspace_class_id)
-            .field("route_id", &self.config.route_id)
+            .field("profile_id", &self.config.profile_id)
             .finish_non_exhaustive()
     }
 }
 
-impl AgentRtExecutor {
+impl ShedExecutor {
     /// Builds the generated gRPC client over deployment-owned configuration.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Config`] when the endpoint, workspace class, route,
-    /// or signing key cannot satisfy the private execution contract.
-    pub(crate) fn new(config: AgentRtExecutorConfig, ledger: RemoteExecutionLedger) -> Result<Self, ToolError> {
-        Ok(Self::from_client(AgentRtClient::new(config)?, ledger))
+    /// Returns [`ToolError::Config`] when the endpoint, profile, or signing key
+    /// cannot satisfy the private execution contract.
+    pub(crate) fn new(config: ShedExecutorConfig, ledger: RemoteExecutionLedger) -> Result<Self, ToolError> {
+        Ok(Self::from_client(ShedClient::new(config)?, ledger))
     }
 
-    pub(crate) fn from_client(client: AgentRtClient, ledger: RemoteExecutionLedger) -> Self {
+    pub(crate) fn from_client(client: ShedClient, ledger: RemoteExecutionLedger) -> Self {
         Self {
             client,
             ledger,
@@ -97,23 +95,20 @@ impl AgentRtExecutor {
     }
 }
 
-impl AgentRtClient {
-    pub(crate) fn new(config: AgentRtExecutorConfig) -> Result<Self, ToolError> {
-        if config.endpoint.trim().is_empty()
-            || config.workspace_class_id.trim().is_empty()
-            || config.route_id.trim().is_empty()
-        {
+impl ShedClient {
+    pub(crate) fn new(config: ShedExecutorConfig) -> Result<Self, ToolError> {
+        if config.endpoint.trim().is_empty() || config.profile_id.trim().is_empty() {
             return Err(ToolError::Config(
-                "agent-rt endpoint, workspace_class_id, and route_id must not be empty".to_owned(),
+                "shed endpoint and profile_id must not be empty".to_owned(),
             ));
         }
         if config.subject_signing_key.expose().len() < 32 {
             return Err(ToolError::Config(
-                "agent-rt subject signing key must contain at least 32 bytes".to_owned(),
+                "shed subject signing key must contain at least 32 bytes".to_owned(),
             ));
         }
         let endpoint = Endpoint::from_shared(config.endpoint.trim_end_matches('/').to_owned())
-            .map_err(|error| ToolError::Config(format!("invalid agent-rt endpoint: {error}")))?
+            .map_err(|error| ToolError::Config(format!("invalid shed endpoint: {error}")))?
             .connect_timeout(config.transport_timeout);
         Ok(Self {
             channel: endpoint.connect_lazy(),
@@ -121,20 +116,20 @@ impl AgentRtClient {
         })
     }
 
-    pub(crate) fn config(&self) -> &AgentRtExecutorConfig {
+    pub(crate) fn config(&self) -> &ShedExecutorConfig {
         &self.config
     }
 
     pub(crate) async fn create_workspace(
         &self,
         workspace_id: &str,
-        workspace_class_id: &str,
+        profile_id: &str,
         token: &str,
         traceparent: Option<&str>,
     ) -> Result<Workspace, RemoteTransportError> {
         let message = CreateWorkspaceRequest {
             workspace_id: workspace_id.to_owned(),
-            workspace_class_id: workspace_class_id.to_owned(),
+            profile_id: profile_id.to_owned(),
         };
         let execute = || async {
             let request = grpc_request(message.clone(), token, self.config.transport_timeout, traceparent)?;
@@ -317,14 +312,14 @@ impl AgentRtClient {
                 .map_err(|error| ToolError::Execution(format!("failed to encode subject assertion: {error}")))?,
         );
         let mut mac = Hmac::<Sha256>::new_from_slice(self.config.subject_signing_key.expose().as_bytes())
-            .map_err(|_| ToolError::Config("invalid agent-rt subject signing key".to_owned()))?;
+            .map_err(|_| ToolError::Config("invalid shed subject signing key".to_owned()))?;
         mac.update(payload.as_bytes());
         let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
         Ok(format!("{payload}.{signature}"))
     }
 }
 
-impl AgentRtExecutor {
+impl ShedExecutor {
     pub(crate) async fn execute_commands_in_workspace(
         &self,
         context: GatewayExecutionContext,
@@ -332,14 +327,14 @@ impl AgentRtExecutor {
         workspace_resolution: WorkspaceResolution,
     ) -> Result<ToolOutput, ToolError> {
         if commands.is_empty() {
-            return Err(ToolError::Config("agent-rt requires at least one command".to_owned()));
+            return Err(ToolError::Config("shed requires at least one command".to_owned()));
         }
         let subject = context.subject.as_ref().ok_or_else(|| {
-            ToolError::Config("agent-rt execution requires an authenticated tenant and principal".to_owned())
+            ToolError::Config("shed execution requires an authenticated tenant and principal".to_owned())
         })?;
         let _workspace_permit = self.workspace_permit(&context.workspace_id).await?;
 
-        let request_fingerprint = request_fingerprint(&self.client.config.route_id, &context.workspace_id, &commands);
+        let request_fingerprint = request_fingerprint(&self.client.config.profile_id, &context.workspace_id, &commands);
         let proposed_deadline = context
             .absolute_deadline
             .unwrap_or_else(|| SystemTime::now() + self.client.config.execution_timeout)
@@ -358,7 +353,6 @@ impl AgentRtExecutor {
                 conversation_id: context.conversation_id.as_deref(),
                 call_id: &context.call_id,
                 workspace_id: &context.workspace_id,
-                route_id: &self.client.config.route_id,
                 request_fingerprint: &request_fingerprint,
                 absolute_deadline: proposed_deadline,
             })
@@ -375,19 +369,19 @@ impl AgentRtExecutor {
                 self.client
                     .create_workspace(
                         &link.workspace_id,
-                        &self.client.config.workspace_class_id,
+                        &self.client.config.profile_id,
                         &token,
                         context.trace_context.traceparent.as_deref(),
                     )
                     .await
-                    .and_then(|workspace| validate_ready_workspace(&workspace, &self.client.config.workspace_class_id))
+                    .and_then(|workspace| validate_ready_workspace(&workspace, &self.client.config.profile_id))
                     .map_err(remote_error)?;
             }
             WorkspaceResolution::Existing => {
                 self.client
                     .get_workspace(&link.workspace_id, &token, context.trace_context.traceparent.as_deref())
                     .await
-                    .and_then(|workspace| validate_ready_workspace(&workspace, &self.client.config.workspace_class_id))
+                    .and_then(|workspace| validate_ready_workspace(&workspace, &self.client.config.profile_id))
                     .map_err(remote_error)?;
             }
         }
@@ -411,7 +405,7 @@ impl AgentRtExecutor {
         }
 
         let outcome = serde_json::to_string(&outcomes)
-            .map_err(|error| ToolError::Execution(format!("failed to serialize agent-rt outcome: {error}")))?;
+            .map_err(|error| ToolError::Execution(format!("failed to serialize shed outcome: {error}")))?;
         self.ledger
             .record_outcome(&link, if cancelled { "cancelled" } else { "completed" }, &outcome)
             .await
@@ -448,7 +442,6 @@ impl AgentRtExecutor {
         let request = StartExecutionRequest {
             execution_id: execution_id.clone(),
             workspace_id: link.workspace_id.clone(),
-            route_id: link.route_id.clone(),
             command: Some(command.command),
             absolute_deadline_unix_millis: command_deadline_millis,
             limits: Some(ExecutionLimits {
@@ -503,7 +496,7 @@ impl AgentRtExecutor {
         semaphore
             .acquire_owned()
             .await
-            .map_err(|_| ToolError::Execution("agent-rt workspace serializer closed unexpectedly".to_owned()))
+            .map_err(|_| ToolError::Execution("shed workspace serializer closed unexpectedly".to_owned()))
     }
 
     async fn start_or_recover(
@@ -693,13 +686,13 @@ impl AgentRtExecutor {
     }
 }
 
-fn validate_ready_workspace(workspace: &Workspace, expected_class_id: &str) -> Result<(), RemoteTransportError> {
-    if workspace.workspace_class_id != expected_class_id {
+fn validate_ready_workspace(workspace: &Workspace, expected_profile_id: &str) -> Result<(), RemoteTransportError> {
+    if workspace.profile_id != expected_profile_id {
         return Err(RemoteTransportError::Rejected {
             code: Code::FailedPrecondition,
             message: format!(
-                "workspace class mismatch: expected {expected_class_id}, got {}",
-                workspace.workspace_class_id
+                "profile mismatch: expected {expected_profile_id}, got {}",
+                workspace.profile_id
             ),
         });
     }
@@ -751,7 +744,7 @@ impl Drop for RemoteCancelOnDrop {
         }
         tokio::spawn(async move {
             if let Err(error) = cancel_execution(channel, transport_timeout, execution_id.clone(), &token).await {
-                tracing::debug!(%execution_id, ?error, "best-effort agent-rt cancellation failed");
+                tracing::debug!(%execution_id, ?error, "best-effort shed cancellation failed");
             }
         });
     }
@@ -795,10 +788,10 @@ fn grpc_request<T>(
     Ok(request)
 }
 
-fn request_fingerprint(route_id: &str, workspace_id: &str, commands: &[RemoteCommand]) -> String {
+fn request_fingerprint(profile_id: &str, workspace_id: &str, commands: &[RemoteCommand]) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"agentic-api-agent-rt-request");
-    hash_bytes(&mut hasher, route_id.as_bytes());
+    hasher.update(b"agentic-api-shed-request");
+    hash_bytes(&mut hasher, profile_id.as_bytes());
     hash_bytes(&mut hasher, workspace_id.as_bytes());
     hash_len(&mut hasher, commands.len());
     for remote in commands {
@@ -872,7 +865,7 @@ fn hash_option_u128(hasher: &mut blake3::Hasher, value: Option<u128>) {
 
 fn child_execution_id(root_execution_id: &str, command_index: usize) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"agentic-api-agent-rt-child-execution");
+    hasher.update(b"agentic-api-shed-child-execution");
     hash_bytes(&mut hasher, root_execution_id.as_bytes());
     hasher.update(&u64::try_from(command_index).unwrap_or(u64::MAX).to_le_bytes());
     format!("exec_{}", hasher.finalize().to_hex())
@@ -895,14 +888,14 @@ fn classify_status(status: &Status) -> RemoteTransportError {
 fn remote_error(error: RemoteTransportError) -> ToolError {
     match error {
         RemoteTransportError::Conflict(message) => {
-            ToolError::Execution(format!("agent-rt execution identity conflict: {message}"))
+            ToolError::Execution(format!("shed execution identity conflict: {message}"))
         }
-        RemoteTransportError::NotFound => ToolError::Execution("agent-rt execution was not found".to_owned()),
+        RemoteTransportError::NotFound => ToolError::Execution("shed execution was not found".to_owned()),
         RemoteTransportError::Rejected { code, message } => {
-            ToolError::Execution(format!("agent-rt rejected execution ({code:?}): {message}"))
+            ToolError::Execution(format!("shed rejected execution ({code:?}): {message}"))
         }
         RemoteTransportError::Ambiguous(message) => {
-            ToolError::Execution(format!("agent-rt transport outcome is ambiguous: {message}"))
+            ToolError::Execution(format!("shed transport outcome is ambiguous: {message}"))
         }
     }
 }
@@ -956,7 +949,6 @@ impl ExecutionOutcomeState {
 pub(crate) struct ExecutionOutcome {
     pub execution_id: String,
     pub workspace_id: String,
-    pub route_id: String,
     pub revision: u64,
     pub state: ExecutionOutcomeState,
     pub result: Option<ExecutionResultProjection>,
@@ -987,7 +979,7 @@ impl TryFrom<Execution> for ExecutionOutcome {
             Ok(ExecutionState::Unspecified) | Err(_) => {
                 return Err(RemoteTransportError::Rejected {
                     code: Code::Internal,
-                    message: "agent-rt returned an unknown execution state".to_owned(),
+                    message: "shed returned an unknown execution state".to_owned(),
                 });
             }
         };
@@ -1002,7 +994,6 @@ impl TryFrom<Execution> for ExecutionOutcome {
         Ok(Self {
             execution_id: record.execution_id,
             workspace_id: record.workspace_id,
-            route_id: record.route_id,
             revision: record.revision,
             state,
             result,
@@ -1027,7 +1018,7 @@ pub(crate) enum RemoteTransportError {
 mod tests {
     use std::collections::HashMap;
 
-    use agent_rt_control::Command;
+    use shed_control::Command;
 
     use super::{RemoteCommand, request_fingerprint};
 
@@ -1047,19 +1038,19 @@ mod tests {
     }
 
     #[test]
-    fn request_fingerprint_is_bound_to_route_workspace_and_code() {
-        let base = request_fingerprint("route-a", "workspace-a", &[command("print(1)")]);
+    fn request_fingerprint_is_bound_to_profile_workspace_and_code() {
+        let base = request_fingerprint("profile-a", "workspace-a", &[command("print(1)")]);
         assert_ne!(
             base,
-            request_fingerprint("route-b", "workspace-a", &[command("print(1)")])
+            request_fingerprint("profile-b", "workspace-a", &[command("print(1)")])
         );
         assert_ne!(
             base,
-            request_fingerprint("route-a", "workspace-b", &[command("print(1)")])
+            request_fingerprint("profile-a", "workspace-b", &[command("print(1)")])
         );
         assert_ne!(
             base,
-            request_fingerprint("route-a", "workspace-a", &[command("print(2)")])
+            request_fingerprint("profile-a", "workspace-a", &[command("print(2)")])
         );
     }
 }

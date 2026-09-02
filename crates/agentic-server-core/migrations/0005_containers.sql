@@ -3,7 +3,7 @@ CREATE TABLE IF NOT EXISTS containers (
     principal_id          TEXT NOT NULL,
     id                    TEXT NOT NULL,
     name                  TEXT NOT NULL,
-    workspace_class_id    TEXT NOT NULL,
+    profile_id    TEXT NOT NULL,
     memory_limit          TEXT NOT NULL,
     status                TEXT NOT NULL,
     expires_after_minutes BIGINT,

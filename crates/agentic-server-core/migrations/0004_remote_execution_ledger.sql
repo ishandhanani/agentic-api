@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS remote_executions (
     call_id             TEXT NOT NULL,
     execution_id        TEXT NOT NULL,
     workspace_id        TEXT NOT NULL,
-    route_id            TEXT NOT NULL,
     request_fingerprint TEXT NOT NULL,
     absolute_deadline   BIGINT NOT NULL,
     state               TEXT NOT NULL,

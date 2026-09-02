@@ -113,10 +113,9 @@ impl std::fmt::Debug for SubjectSigningKey {
 }
 
 #[derive(Debug, Clone)]
-pub struct AgentRtExecutorConfig {
+pub struct ShedExecutorConfig {
     pub endpoint: String,
-    pub workspace_class_id: String,
-    pub route_id: String,
+    pub profile_id: String,
     pub subject_signing_key: SubjectSigningKey,
     pub subject_issuer: String,
     pub subject_audience: String,
@@ -133,8 +132,8 @@ pub struct ToolRuntimeConfig {
     pub mcp_servers: HashMap<String, McpServerEntry>,
     pub mcp_allowed_hosts: Vec<String>,
     pub messages_gateway_tool_aliases: Option<String>,
-    /// Optional direct remote executor for managed-environment built-in tools.
-    pub agent_rt: Option<AgentRtExecutorConfig>,
+    /// Optional Shed executor for managed-environment built-in tools.
+    pub shed: Option<ShedExecutorConfig>,
     /// Upper bound on gateway-owned tool calls executing concurrently within one
     /// round. A sliding window admits another call as one finishes. Handlers with
     /// nested outbound work also use this value as their provider-level concurrency
@@ -151,7 +150,7 @@ impl Default for ToolRuntimeConfig {
             mcp_servers: HashMap::default(),
             mcp_allowed_hosts: Vec::default(),
             messages_gateway_tool_aliases: None,
-            agent_rt: None,
+            shed: None,
             max_concurrent_gateway_calls: DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS,
         }
     }

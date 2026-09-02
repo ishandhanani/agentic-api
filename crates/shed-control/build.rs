@@ -5,7 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_protos(&["proto/agent_rt/control.proto"], &["proto"])?;
-    println!("cargo:rerun-if-changed=proto/agent_rt/control.proto");
+        .compile_protos(&["proto/shed/control.proto"], &["proto"])?;
+    println!("cargo:rerun-if-changed=proto/shed/control.proto");
     Ok(())
 }

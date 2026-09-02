@@ -1,9 +1,9 @@
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_rt_control::{Workspace, WorkspaceState};
 use bytes::Bytes;
 use futures::Stream;
+use shed_control::{Workspace, WorkspaceState};
 use tonic::Code;
 use uuid::Uuid;
 
@@ -12,7 +12,7 @@ use crate::storage::{
     ClaimContainer, ClaimContainerFile, ContainerFileRecord, ContainerFileStore, ContainerOrder, ContainerRecord,
     ContainerStore, StorageError,
 };
-use crate::tool::agent_rt::{AgentRtClient, RemoteFileWrite, RemoteTransportError};
+use crate::tool::shed::{RemoteFileWrite, RemoteTransportError, ShedClient};
 use crate::tool::{AuthenticatedSubject, ToolError};
 use crate::types::{
     Container, ContainerExpiration, ContainerExpirationAnchor, ContainerFile, ContainerFileList, ContainerList,
@@ -26,12 +26,12 @@ const MAX_CONTAINER_NAME_BYTES: usize = 256;
 const FILE_CHUNK_BYTES: usize = 1024 * 1024;
 const FILE_CHUNK_BYTES_U64: u64 = 1024 * 1024;
 
-/// Raw container file bytes streamed from agent-rt.
+/// Raw container file bytes streamed from shed.
 pub type ContainerFileContent = Pin<Box<dyn Stream<Item = Result<Bytes, ContainerError>> + Send>>;
 
 #[derive(Clone, Debug)]
 pub struct ContainerService {
-    client: AgentRtClient,
+    client: ShedClient,
     store: ContainerStore,
     file_store: ContainerFileStore,
 }
@@ -51,7 +51,7 @@ pub enum ContainerError {
 }
 
 impl ContainerService {
-    pub(crate) fn new(client: AgentRtClient, store: ContainerStore, file_store: ContainerFileStore) -> Self {
+    pub(crate) fn new(client: ShedClient, store: ContainerStore, file_store: ContainerFileStore) -> Self {
         Self {
             client,
             store,
@@ -59,11 +59,11 @@ impl ContainerService {
         }
     }
 
-    /// Creates a public container backed by an agent-rt workspace.
+    /// Creates a public container backed by an shed workspace.
     ///
     /// # Errors
     ///
-    /// Returns an error when the request is invalid, persistence fails, or agent-rt rejects workspace creation.
+    /// Returns an error when the request is invalid, persistence fails, or shed rejects workspace creation.
     pub async fn create(
         &self,
         subject: &AuthenticatedSubject,
@@ -73,14 +73,14 @@ impl ContainerService {
         validate_create_request(&request)?;
         let name = request.name.trim();
         let id = format!("cntr_{}", Uuid::now_v7().simple());
-        let workspace_class_id = self.client.config().workspace_class_id.as_str();
+        let profile_id = self.client.config().profile_id.as_str();
         let memory_limit = memory_limit_str(request.memory_limit.unwrap_or(ShellMemoryLimitParam::OneGiB));
         self.store
             .claim(ClaimContainer {
                 subject,
                 id: &id,
                 name,
-                workspace_class_id,
+                profile_id,
                 memory_limit,
                 created_at_millis: unix_millis(),
             })
@@ -92,17 +92,17 @@ impl ContainerService {
             .map_err(ContainerError::from_tool)?;
         let workspace = self
             .client
-            .create_workspace(&id, workspace_class_id, &token, traceparent)
+            .create_workspace(&id, profile_id, &token, traceparent)
             .await
             .map_err(|error| ContainerError::from_remote("container", &id, error))?;
         self.sync_workspace(subject, &id, workspace).await
     }
 
-    /// Retrieves and refreshes a public container from its agent-rt workspace.
+    /// Retrieves and refreshes a public container from its shed workspace.
     ///
     /// # Errors
     ///
-    /// Returns an error when the container does not exist or agent-rt cannot resolve its workspace.
+    /// Returns an error when the container does not exist or shed cannot resolve its workspace.
     pub async fn retrieve(
         &self,
         subject: &AuthenticatedSubject,
@@ -163,7 +163,7 @@ impl ContainerService {
         })
     }
 
-    /// Deletes a public container and its agent-rt workspace.
+    /// Deletes a public container and its shed workspace.
     ///
     /// # Errors
     ///
@@ -197,7 +197,7 @@ impl ContainerService {
         })
     }
 
-    /// Uploads a public container file through the agent-rt workspace file service.
+    /// Uploads a public container file through the shed workspace file service.
     ///
     /// # Errors
     ///
@@ -275,7 +275,7 @@ impl ContainerService {
             }
         }
         let metadata = final_metadata.ok_or_else(|| {
-            ContainerError::Remote("agent-rt did not return metadata for a container file write".to_owned())
+            ContainerError::Remote("shed did not return metadata for a container file write".to_owned())
         })?;
         let expected_size = u64::try_from(content.len())
             .map_err(|_| ContainerError::Invalid("container file is too large".to_owned()))?;
@@ -299,7 +299,7 @@ impl ContainerService {
     ///
     /// # Errors
     ///
-    /// Returns an error when the container or file is absent or agent-rt returns an invalid file binding.
+    /// Returns an error when the container or file is absent or shed returns an invalid file binding.
     pub async fn retrieve_file(
         &self,
         subject: &AuthenticatedSubject,
@@ -383,7 +383,7 @@ impl ContainerService {
         })
     }
 
-    /// Streams raw public container file content from agent-rt.
+    /// Streams raw public container file content from shed.
     ///
     /// # Errors
     ///
@@ -428,13 +428,13 @@ impl ContainerService {
                     .await
                     .map_err(|error| ContainerError::from_remote("container file", &id, error))?;
                 let data_len = u64::try_from(chunk.data.len())
-                    .map_err(|_| ContainerError::Remote("agent-rt returned an oversized file chunk".to_owned()))?;
+                    .map_err(|_| ContainerError::Remote("shed returned an oversized file chunk".to_owned()))?;
                 let expected_offset = offset.checked_add(data_len).ok_or_else(|| {
-                    ContainerError::Remote("agent-rt returned an overflowing file offset".to_owned())
+                    ContainerError::Remote("shed returned an overflowing file offset".to_owned())
                 })?;
                 if chunk.next_offset != expected_offset || (!chunk.eof && data_len == 0) {
                     Err(ContainerError::Remote(
-                        "agent-rt returned a non-monotonic container file chunk".to_owned(),
+                        "shed returned a non-monotonic container file chunk".to_owned(),
                     ))?;
                 }
                 if !chunk.data.is_empty() {
@@ -448,7 +448,7 @@ impl ContainerService {
         }))
     }
 
-    /// Deletes a public container file from agent-rt and the catalog.
+    /// Deletes a public container file from shed and the catalog.
     ///
     /// # Errors
     ///
@@ -494,9 +494,9 @@ impl ContainerService {
         id: &str,
         workspace: Workspace,
     ) -> Result<Container, ContainerError> {
-        if workspace.workspace_id != id || workspace.workspace_class_id != self.client.config().workspace_class_id {
+        if workspace.workspace_id != id || workspace.profile_id != self.client.config().profile_id {
             return Err(ContainerError::Remote(
-                "agent-rt returned a workspace outside the requested logical binding".to_owned(),
+                "shed returned a workspace outside the requested logical binding".to_owned(),
             ));
         }
         let status = workspace_status(workspace.state)?;
@@ -572,7 +572,7 @@ fn validate_create_request(request: &CreateContainerRequest) -> Result<(), Conta
     }
     if request.expires_after.is_some() {
         return Err(ContainerError::Invalid(
-            "custom expires_after is not supported; the operator workspace class owns retention".to_owned(),
+            "custom expires_after is not supported; the operator profile owns retention".to_owned(),
         ));
     }
     if !request.file_ids.is_empty() {
@@ -610,7 +610,7 @@ fn workspace_status(state: i32) -> Result<&'static str, ContainerError> {
         Ok(WorkspaceState::Deleted) => Ok("deleted"),
         Ok(WorkspaceState::Failed) => Ok("failed"),
         Ok(WorkspaceState::Unspecified) | Err(_) => Err(ContainerError::Remote(
-            "agent-rt returned an unknown workspace state".to_owned(),
+            "shed returned an unknown workspace state".to_owned(),
         )),
     }
 }
@@ -700,7 +700,7 @@ fn validate_file_metadata(
 ) -> Result<(), ContainerError> {
     if actual_path != expected_path || is_directory || expected_size.is_some_and(|size| size != actual_size) {
         return Err(ContainerError::Remote(format!(
-            "agent-rt returned metadata outside container file binding '{id}'"
+            "shed returned metadata outside container file binding '{id}'"
         )));
     }
     Ok(())

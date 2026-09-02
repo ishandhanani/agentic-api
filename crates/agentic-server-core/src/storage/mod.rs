@@ -3,7 +3,7 @@
 // Database URL classification and sanitization
 pub mod backend;
 
-// Public container metadata and pagination; physical lifecycle remains in agent-rt.
+// Public container metadata and pagination; physical lifecycle remains in shed.
 pub(crate) mod container;
 pub(crate) mod container_file;
 
