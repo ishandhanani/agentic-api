@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -5,23 +6,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_rt_control::execution_service_server::{ExecutionService, ExecutionServiceServer};
+use agent_rt_control::workspace_file_service_server::{WorkspaceFileService, WorkspaceFileServiceServer};
 use agent_rt_control::workspace_service_server::{WorkspaceService, WorkspaceServiceServer};
 use agent_rt_control::{
     CancelExecutionRequest, Capability, CreateWorkspaceRequest, DeleteWorkspaceRequest, Execution, ExecutionResult,
-    ExecutionState, GetExecutionRequest, GetWorkspaceRequest, StartExecutionRequest, WatchExecutionRequest, Workspace,
-    WorkspaceState,
+    ExecutionState, FileChunk, FileMetadata, GetExecutionRequest, GetWorkspaceRequest, ListFilesRequest,
+    ListFilesResponse, ReadFileRequest, RemoveFileRequest, RemoveFileResponse, StartExecutionRequest, StatFileRequest,
+    WatchExecutionRequest, Workspace, WorkspaceState, WriteFileRequest,
 };
 use agentic_core::config::{
     AgentRtExecutorConfig, Config, PostgresConfig, SqliteConfig, SubjectSigningKey, ToolRuntimeConfig,
 };
 use agentic_core::executor::{ExecuteRequest, ExecutionContext};
 use agentic_core::types::io::{OutputItem, ShellCallEnvironment, ShellCallOutcome, ShellCallStatus};
+use agentic_core::{AuthenticatedSubject, CreateContainerRequest, ListContainerFilesRequest, ListContainersRequest};
 use axum::extract::State;
 use axum::routing::post;
 use either::Either;
-use futures::Stream;
+use futures::{Stream, TryStreamExt};
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
+
+type WorkspaceFiles = Arc<Mutex<HashMap<(String, String), Vec<u8>>>>;
 
 #[derive(Clone, Default)]
 struct InferenceState {
@@ -73,6 +79,8 @@ async fn inference(
 struct AgentRtState {
     workspace_requests: Arc<Mutex<Vec<CreateWorkspaceRequest>>>,
     execution_requests: Arc<Mutex<Vec<StartExecutionRequest>>>,
+    file_write_requests: Arc<Mutex<Vec<WriteFileRequest>>>,
+    files: WorkspaceFiles,
 }
 
 fn assert_subject<T>(request: &Request<T>) {
@@ -128,8 +136,102 @@ impl WorkspaceService for AgentRtState {
         }))
     }
 
-    async fn delete_workspace(&self, _request: Request<DeleteWorkspaceRequest>) -> Result<Response<Workspace>, Status> {
-        Err(Status::unimplemented("not needed by this integration test"))
+    async fn delete_workspace(&self, request: Request<DeleteWorkspaceRequest>) -> Result<Response<Workspace>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        Ok(Response::new(Workspace {
+            workspace_id: request.workspace_id,
+            workspace_class_id: "python.default".to_owned(),
+            workspace_class_revision: "python.default@sha256:test".to_owned(),
+            state: WorkspaceState::Deleted as i32,
+            revision: 2,
+            created_at_unix_millis: 1,
+            last_active_at_unix_millis: 2,
+            expires_at_unix_millis: None,
+            capabilities: Vec::new(),
+            failure_code: None,
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl WorkspaceFileService for AgentRtState {
+    async fn stat_file(&self, request: Request<StatFileRequest>) -> Result<Response<FileMetadata>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        let files = self.files.lock().await;
+        let content = files
+            .get(&(request.workspace_id, request.path.clone()))
+            .ok_or_else(|| Status::not_found("file_not_found"))?;
+        Ok(Response::new(file_metadata(request.path, content.len())))
+    }
+
+    async fn list_files(&self, _request: Request<ListFilesRequest>) -> Result<Response<ListFilesResponse>, Status> {
+        Err(Status::unimplemented(
+            "public listing uses the durable container catalog",
+        ))
+    }
+
+    async fn read_file(&self, request: Request<ReadFileRequest>) -> Result<Response<FileChunk>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        let files = self.files.lock().await;
+        let content = files
+            .get(&(request.workspace_id, request.path))
+            .ok_or_else(|| Status::not_found("file_not_found"))?;
+        let start = usize::try_from(request.offset).map_err(|_| Status::invalid_argument("invalid_offset"))?;
+        let max_bytes =
+            usize::try_from(request.max_bytes).map_err(|_| Status::invalid_argument("invalid_max_bytes"))?;
+        if start > content.len() {
+            return Err(Status::invalid_argument("invalid_offset"));
+        }
+        let end = start.saturating_add(max_bytes).min(content.len());
+        Ok(Response::new(FileChunk {
+            data: content[start..end].to_vec(),
+            next_offset: u64::try_from(end).expect("test file offset fits u64"),
+            eof: end == content.len(),
+        }))
+    }
+
+    async fn write_file(&self, request: Request<WriteFileRequest>) -> Result<Response<FileMetadata>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        self.file_write_requests.lock().await.push(request.clone());
+        let key = (request.workspace_id, request.path.clone());
+        let mut files = self.files.lock().await;
+        let content = files.entry(key).or_default();
+        if request.truncate {
+            content.clear();
+        }
+        let start = usize::try_from(request.offset).map_err(|_| Status::invalid_argument("invalid_offset"))?;
+        if start > content.len() {
+            return Err(Status::invalid_argument("invalid_offset"));
+        }
+        let end = start
+            .checked_add(request.data.len())
+            .ok_or_else(|| Status::invalid_argument("file_too_large"))?;
+        content.resize(end, 0);
+        content[start..end].copy_from_slice(&request.data);
+        Ok(Response::new(file_metadata(request.path, content.len())))
+    }
+
+    async fn remove_file(&self, request: Request<RemoveFileRequest>) -> Result<Response<RemoveFileResponse>, Status> {
+        assert_subject(&request);
+        let request = request.into_inner();
+        let removed = self.files.lock().await.remove(&(request.workspace_id, request.path));
+        if removed.is_none() {
+            return Err(Status::not_found("file_not_found"));
+        }
+        Ok(Response::new(RemoveFileResponse {}))
+    }
+}
+
+fn file_metadata(path: String, size: usize) -> FileMetadata {
+    FileMetadata {
+        path,
+        size_bytes: u64::try_from(size).expect("test file size fits u64"),
+        is_directory: false,
+        modified_at_unix_millis: Some(2),
     }
 }
 
@@ -213,7 +315,8 @@ async fn serve_agent_rt(state: AgentRtState) -> (String, tokio::task::JoinHandle
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(WorkspaceServiceServer::new(state.clone()))
-            .add_service(ExecutionServiceServer::new(state))
+            .add_service(ExecutionServiceServer::new(state.clone()))
+            .add_service(WorkspaceFileServiceServer::new(state))
             .serve_with_incoming(incoming)
             .await
             .ok();
@@ -357,5 +460,112 @@ async fn shell_reuses_referenced_agent_rt_workspace_and_projects_native_outputs(
     assert_eq!(ledger_state, "completed");
 
     inference_server.abort();
+    agent_rt_server.abort();
+}
+
+#[tokio::test]
+async fn containers_catalog_maps_lifecycle_and_files_to_agent_rt() {
+    let agent_rt_state = AgentRtState::default();
+    let (agent_rt_url, agent_rt_server) = serve_agent_rt(agent_rt_state.clone()).await;
+    let exec_ctx = ExecutionContext::from_config(&test_config("http://127.0.0.1:1".to_owned(), agent_rt_url))
+        .await
+        .expect("execution context");
+    let service = exec_ctx.container_service().expect("container service");
+    let subject = AuthenticatedSubject {
+        tenant_id: "tenant-a".to_owned(),
+        principal_id: "principal-a".to_owned(),
+    };
+    let traceparent = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    let create: CreateContainerRequest =
+        serde_json::from_value(serde_json::json!({"name": "test-container"})).expect("create container request");
+
+    let container = service
+        .create(&subject, create, traceparent)
+        .await
+        .expect("create container");
+    assert!(container.id.starts_with("cntr_"));
+    assert_eq!(container.name, "test-container");
+    assert_eq!(container.status, "running");
+
+    let mut expected = vec![b'a'; 1024 * 1024];
+    expected.extend_from_slice(b"tail");
+    let file = service
+        .create_file(
+            &subject,
+            &container.id,
+            "../results?.txt",
+            bytes::Bytes::from(expected.clone()),
+            traceparent,
+        )
+        .await
+        .expect("create container file");
+    assert!(file.id.starts_with("cfile_"));
+    assert_eq!(file.container_id, container.id);
+    assert!(file.path.ends_with("-results_.txt"));
+    assert_eq!(file.bytes, u64::try_from(expected.len()).expect("test size fits u64"));
+
+    let writes = agent_rt_state.file_write_requests.lock().await;
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].offset, 0);
+    assert!(writes[0].truncate);
+    assert_eq!(writes[1].offset, 1024 * 1024);
+    assert!(!writes[1].truncate);
+    drop(writes);
+
+    let retrieved = service
+        .retrieve_file(&subject, &container.id, &file.id, traceparent)
+        .await
+        .expect("retrieve container file");
+    assert_eq!(retrieved.bytes, file.bytes);
+    let files = service
+        .list_files(
+            &subject,
+            &container.id,
+            serde_json::from_value::<ListContainerFilesRequest>(serde_json::json!({})).expect("list files request"),
+        )
+        .await
+        .expect("list container files");
+    assert_eq!(files.data.len(), 1);
+    assert_eq!(files.first_id.as_deref(), Some(file.id.as_str()));
+    assert!(!files.has_more);
+
+    let chunks = service
+        .read_file_content(&subject, &container.id, &file.id, traceparent)
+        .await
+        .expect("container file content")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("read container file content");
+    assert_eq!(chunks.concat(), expected);
+
+    let deleted_file = service
+        .delete_file(&subject, &container.id, &file.id, traceparent)
+        .await
+        .expect("delete container file");
+    assert!(deleted_file.deleted);
+    let files = service
+        .list_files(
+            &subject,
+            &container.id,
+            serde_json::from_value::<ListContainerFilesRequest>(serde_json::json!({})).expect("list files request"),
+        )
+        .await
+        .expect("list container files after deletion");
+    assert!(files.data.is_empty());
+
+    let deleted = service
+        .delete(&subject, &container.id, traceparent)
+        .await
+        .expect("delete container");
+    assert!(deleted.deleted);
+    let containers = service
+        .list(
+            &subject,
+            serde_json::from_value::<ListContainersRequest>(serde_json::json!({})).expect("list containers request"),
+        )
+        .await
+        .expect("list containers after deletion");
+    assert!(containers.data.is_empty());
+
     agent_rt_server.abort();
 }

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-use axum::Router;
 use axum::middleware;
 use axum::routing::{get, post};
+use axum::{Router, extract::DefaultBodyLimit};
 use http::HeaderValue;
 #[cfg(debug_assertions)]
 use tokio::sync::oneshot;
@@ -16,8 +16,12 @@ use agentic_core::proxy::ProxyState;
 
 use crate::auth::{ANTHROPIC_COUNT_TOKENS_PATH, ANTHROPIC_MESSAGES_PATH, OidcAuthenticator, require_oidc};
 use crate::handler::{
-    compact_response, conversations, count_tokens, health, messages, models, ready, responses, responses_ws_with_auth,
+    compact_response, conversations, count_tokens, create_container, create_container_file, delete_container,
+    delete_container_file, health, list_container_files, list_containers, messages, models, ready, responses,
+    responses_ws_with_auth, retrieve_container, retrieve_container_file, retrieve_container_file_content,
 };
+
+const MAX_CONTAINER_FILE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone, Default)]
 pub struct WebSocketTracker {
@@ -247,6 +251,25 @@ pub fn build_router_with_auth(
     let public_routes = Router::new().route("/health", get(health)).route("/ready", get(ready));
     let protected_routes = Router::new()
         .route("/v1/conversations", post(conversations))
+        .route("/v1/containers", post(create_container).get(list_containers))
+        .route(
+            "/v1/containers/{container_id}",
+            get(retrieve_container).delete(delete_container),
+        )
+        .route(
+            "/v1/containers/{container_id}/files",
+            post(create_container_file)
+                .get(list_container_files)
+                .layer(DefaultBodyLimit::max(MAX_CONTAINER_FILE_UPLOAD_BYTES)),
+        )
+        .route(
+            "/v1/containers/{container_id}/files/{file_id}",
+            get(retrieve_container_file).delete(delete_container_file),
+        )
+        .route(
+            "/v1/containers/{container_id}/files/{file_id}/content",
+            get(retrieve_container_file_content),
+        )
         .route("/v1/models", get(models))
         .route(ANTHROPIC_MESSAGES_PATH, post(messages))
         .route(ANTHROPIC_COUNT_TOKENS_PATH, post(count_tokens))

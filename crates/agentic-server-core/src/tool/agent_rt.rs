@@ -3,10 +3,13 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_rt_control::execution_service_client::ExecutionServiceClient;
+use agent_rt_control::workspace_file_service_client::WorkspaceFileServiceClient;
 use agent_rt_control::workspace_service_client::WorkspaceServiceClient;
 use agent_rt_control::{
-    CancelExecutionRequest, Command, CreateWorkspaceRequest, Execution, ExecutionLimits, ExecutionState,
-    GetExecutionRequest, GetWorkspaceRequest, StartExecutionRequest, WatchExecutionRequest, Workspace, WorkspaceState,
+    CancelExecutionRequest, Command, CreateWorkspaceRequest, DeleteWorkspaceRequest, Execution, ExecutionLimits,
+    ExecutionState, FileChunk, FileMetadata, GetExecutionRequest, GetWorkspaceRequest, ReadFileRequest,
+    RemoveFileRequest, StartExecutionRequest, StatFileRequest, WatchExecutionRequest, Workspace, WorkspaceState,
+    WriteFileRequest,
 };
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -17,16 +20,27 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 
-use super::{GatewayExecutionContext, ToolError, ToolOutput};
+use super::{AuthenticatedSubject, GatewayExecutionContext, ToolError, ToolOutput};
 use crate::config::AgentRtExecutorConfig;
 use crate::storage::{ClaimRemoteExecution, RemoteExecutionLedger, RemoteExecutionLink};
 
 #[derive(Clone)]
 pub(crate) struct AgentRtExecutor {
-    channel: Channel,
-    config: AgentRtExecutorConfig,
+    client: AgentRtClient,
     ledger: RemoteExecutionLedger,
     workspace_locks: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentRtClient {
+    channel: Channel,
+    config: AgentRtExecutorConfig,
+}
+
+pub(crate) struct RemoteFileWrite {
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub truncate: bool,
 }
 
 pub(crate) struct RemoteCommand {
@@ -45,6 +59,17 @@ impl std::fmt::Debug for AgentRtExecutor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AgentRtExecutor")
+            .field("endpoint", &self.client.config.endpoint)
+            .field("workspace_class_id", &self.client.config.workspace_class_id)
+            .field("route_id", &self.client.config.route_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AgentRtClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentRtClient")
             .field("endpoint", &self.config.endpoint)
             .field("workspace_class_id", &self.config.workspace_class_id)
             .field("route_id", &self.config.route_id)
@@ -60,6 +85,20 @@ impl AgentRtExecutor {
     /// Returns [`ToolError::Config`] when the endpoint, workspace class, route,
     /// or signing key cannot satisfy the private execution contract.
     pub(crate) fn new(config: AgentRtExecutorConfig, ledger: RemoteExecutionLedger) -> Result<Self, ToolError> {
+        Ok(Self::from_client(AgentRtClient::new(config)?, ledger))
+    }
+
+    pub(crate) fn from_client(client: AgentRtClient, ledger: RemoteExecutionLedger) -> Self {
+        Self {
+            client,
+            ledger,
+            workspace_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl AgentRtClient {
+    pub(crate) fn new(config: AgentRtExecutorConfig) -> Result<Self, ToolError> {
         if config.endpoint.trim().is_empty()
             || config.workspace_class_id.trim().is_empty()
             || config.route_id.trim().is_empty()
@@ -79,11 +118,209 @@ impl AgentRtExecutor {
         Ok(Self {
             channel: endpoint.connect_lazy(),
             config,
-            ledger,
-            workspace_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
+    pub(crate) fn config(&self) -> &AgentRtExecutorConfig {
+        &self.config
+    }
+
+    pub(crate) async fn create_workspace(
+        &self,
+        workspace_id: &str,
+        workspace_class_id: &str,
+        token: &str,
+        traceparent: Option<&str>,
+    ) -> Result<Workspace, RemoteTransportError> {
+        let message = CreateWorkspaceRequest {
+            workspace_id: workspace_id.to_owned(),
+            workspace_class_id: workspace_class_id.to_owned(),
+        };
+        let execute = || async {
+            let request = grpc_request(message.clone(), token, self.config.transport_timeout, traceparent)?;
+            WorkspaceServiceClient::new(self.channel.clone())
+                .create_workspace(request)
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(|status| classify_status(&status))
+        };
+        match execute().await {
+            Ok(workspace) => Ok(workspace),
+            Err(RemoteTransportError::Ambiguous(_)) => execute().await,
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn get_workspace(
+        &self,
+        workspace_id: &str,
+        token: &str,
+        traceparent: Option<&str>,
+    ) -> Result<Workspace, RemoteTransportError> {
+        let request = grpc_request(
+            GetWorkspaceRequest {
+                workspace_id: workspace_id.to_owned(),
+            },
+            token,
+            self.config.transport_timeout,
+            traceparent,
+        )?;
+        WorkspaceServiceClient::new(self.channel.clone())
+            .get_workspace(request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| classify_status(&status))
+    }
+
+    pub(crate) async fn delete_workspace(
+        &self,
+        workspace_id: &str,
+        token: &str,
+        traceparent: Option<&str>,
+    ) -> Result<Workspace, RemoteTransportError> {
+        let request = grpc_request(
+            DeleteWorkspaceRequest {
+                workspace_id: workspace_id.to_owned(),
+            },
+            token,
+            self.config.transport_timeout,
+            traceparent,
+        )?;
+        WorkspaceServiceClient::new(self.channel.clone())
+            .delete_workspace(request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| classify_status(&status))
+    }
+
+    pub(crate) async fn stat_file(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        token: &str,
+        traceparent: Option<&str>,
+    ) -> Result<FileMetadata, RemoteTransportError> {
+        let request = grpc_request(
+            StatFileRequest {
+                workspace_id: workspace_id.to_owned(),
+                path: path.to_owned(),
+            },
+            token,
+            self.config.transport_timeout,
+            traceparent,
+        )?;
+        WorkspaceFileServiceClient::new(self.channel.clone())
+            .stat_file(request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| classify_status(&status))
+    }
+
+    pub(crate) async fn read_file(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        offset: u64,
+        max_bytes: u64,
+        token: &str,
+        traceparent: Option<&str>,
+    ) -> Result<FileChunk, RemoteTransportError> {
+        let request = grpc_request(
+            ReadFileRequest {
+                workspace_id: workspace_id.to_owned(),
+                path: path.to_owned(),
+                offset,
+                max_bytes,
+            },
+            token,
+            self.config.transport_timeout,
+            traceparent,
+        )?;
+        WorkspaceFileServiceClient::new(self.channel.clone())
+            .read_file(request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| classify_status(&status))
+    }
+
+    pub(crate) async fn write_file(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        write: RemoteFileWrite,
+        token: &str,
+        traceparent: Option<&str>,
+    ) -> Result<FileMetadata, RemoteTransportError> {
+        let message = WriteFileRequest {
+            workspace_id: workspace_id.to_owned(),
+            path: path.to_owned(),
+            offset: write.offset,
+            data: write.data,
+            truncate: write.truncate,
+        };
+        let execute = || async {
+            let request = grpc_request(message.clone(), token, self.config.transport_timeout, traceparent)?;
+            WorkspaceFileServiceClient::new(self.channel.clone())
+                .write_file(request)
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(|status| classify_status(&status))
+        };
+        match execute().await {
+            Ok(metadata) => Ok(metadata),
+            Err(RemoteTransportError::Ambiguous(_)) => execute().await,
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn remove_file(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        token: &str,
+        traceparent: Option<&str>,
+    ) -> Result<(), RemoteTransportError> {
+        let request = grpc_request(
+            RemoveFileRequest {
+                workspace_id: workspace_id.to_owned(),
+                path: path.to_owned(),
+                recursive: false,
+            },
+            token,
+            self.config.transport_timeout,
+            traceparent,
+        )?;
+        WorkspaceFileServiceClient::new(self.channel.clone())
+            .remove_file(request)
+            .await
+            .map(|_| ())
+            .map_err(|status| classify_status(&status))
+    }
+
+    pub(crate) fn sign_subject(&self, subject: &AuthenticatedSubject, token_id: &str) -> Result<String, ToolError> {
+        let now = u64::try_from(unix_seconds_i64()).unwrap_or_default();
+        let claims = SubjectClaims {
+            issuer: self.config.subject_issuer.clone(),
+            audience: self.config.subject_audience.clone(),
+            tenant_id: subject.tenant_id.clone(),
+            principal_id: subject.principal_id.clone(),
+            issued_at: now,
+            expires_at: now.saturating_add(60),
+            token_id: token_id.to_owned(),
+        };
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&claims)
+                .map_err(|error| ToolError::Execution(format!("failed to encode subject assertion: {error}")))?,
+        );
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.config.subject_signing_key.expose().as_bytes())
+            .map_err(|_| ToolError::Config("invalid agent-rt subject signing key".to_owned()))?;
+        mac.update(payload.as_bytes());
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        Ok(format!("{payload}.{signature}"))
+    }
+}
+
+impl AgentRtExecutor {
     pub(crate) async fn execute_commands_in_workspace(
         &self,
         context: GatewayExecutionContext,
@@ -98,10 +335,10 @@ impl AgentRtExecutor {
         })?;
         let _workspace_permit = self.workspace_permit(&context.workspace_id).await?;
 
-        let request_fingerprint = request_fingerprint(&self.config.route_id, &context.workspace_id, &commands);
+        let request_fingerprint = request_fingerprint(&self.client.config.route_id, &context.workspace_id, &commands);
         let proposed_deadline = context
             .absolute_deadline
-            .unwrap_or_else(|| SystemTime::now() + self.config.execution_timeout)
+            .unwrap_or_else(|| SystemTime::now() + self.client.config.execution_timeout)
             .duration_since(UNIX_EPOCH)
             .map_err(|_| ToolError::Config("execution deadline precedes the Unix epoch".to_owned()))?;
         let proposed_deadline = proposed_deadline
@@ -117,7 +354,7 @@ impl AgentRtExecutor {
                 conversation_id: context.conversation_id.as_deref(),
                 call_id: &context.call_id,
                 workspace_id: &context.workspace_id,
-                route_id: &self.config.route_id,
+                route_id: &self.client.config.route_id,
                 request_fingerprint: &request_fingerprint,
                 absolute_deadline: proposed_deadline,
             })
@@ -128,16 +365,25 @@ impl AgentRtExecutor {
                 "remote execution identity does not match the durable logical-call binding".to_owned(),
             ));
         }
-        let token = self.sign_subject(&link)?;
+        let token = self.client.sign_subject(subject, &link.execution_id)?;
         match workspace_resolution {
             WorkspaceResolution::CreateOrGet => {
-                self.create_workspace(&link, &token, context.trace_context.traceparent.as_deref())
+                self.client
+                    .create_workspace(
+                        &link.workspace_id,
+                        &self.client.config.workspace_class_id,
+                        &token,
+                        context.trace_context.traceparent.as_deref(),
+                    )
                     .await
+                    .and_then(|workspace| validate_ready_workspace(&workspace, &self.client.config.workspace_class_id))
                     .map_err(remote_error)?;
             }
             WorkspaceResolution::Existing => {
-                self.get_workspace(&link, &token, context.trace_context.traceparent.as_deref())
+                self.client
+                    .get_workspace(&link.workspace_id, &token, context.trace_context.traceparent.as_deref())
                     .await
+                    .and_then(|workspace| validate_ready_workspace(&workspace, &self.client.config.workspace_class_id))
                     .map_err(remote_error)?;
             }
         }
@@ -219,8 +465,8 @@ impl AgentRtExecutor {
             .collect(),
         };
         let mut cancel_on_drop = RemoteCancelOnDrop::new(
-            self.channel.clone(),
-            self.config.transport_timeout,
+            self.client.channel.clone(),
+            self.client.config.transport_timeout,
             execution_id.clone(),
             token.to_owned(),
         );
@@ -254,54 +500,6 @@ impl AgentRtExecutor {
             .acquire_owned()
             .await
             .map_err(|_| ToolError::Execution("agent-rt workspace serializer closed unexpectedly".to_owned()))
-    }
-
-    async fn create_workspace(
-        &self,
-        link: &RemoteExecutionLink,
-        token: &str,
-        traceparent: Option<&str>,
-    ) -> Result<(), RemoteTransportError> {
-        let message = CreateWorkspaceRequest {
-            workspace_id: link.workspace_id.clone(),
-            workspace_class_id: self.config.workspace_class_id.clone(),
-        };
-        let execute = || async {
-            let request = grpc_request(message.clone(), token, self.config.transport_timeout, traceparent)?;
-            WorkspaceServiceClient::new(self.channel.clone())
-                .create_workspace(request)
-                .await
-                .map(tonic::Response::into_inner)
-                .map_err(|status| classify_status(&status))
-        };
-        let workspace = match execute().await {
-            Ok(workspace) => workspace,
-            Err(RemoteTransportError::Ambiguous(_)) => execute().await?,
-            Err(error) => return Err(error),
-        };
-        validate_ready_workspace(&workspace, &self.config.workspace_class_id)
-    }
-
-    async fn get_workspace(
-        &self,
-        link: &RemoteExecutionLink,
-        token: &str,
-        traceparent: Option<&str>,
-    ) -> Result<(), RemoteTransportError> {
-        let request = grpc_request(
-            GetWorkspaceRequest {
-                workspace_id: link.workspace_id.clone(),
-            },
-            token,
-            self.config.transport_timeout,
-            traceparent,
-        )?;
-        let workspace = WorkspaceServiceClient::new(self.channel.clone())
-            .get_workspace(request)
-            .await
-            .map(tonic::Response::into_inner)
-            .map_err(|status| classify_status(&status))?;
-        validate_ready_workspace(&workspace, &self.config.workspace_class_id)
     }
 
     async fn start_or_recover(
@@ -423,8 +621,8 @@ impl AgentRtExecutor {
         token: &str,
         traceparent: Option<&str>,
     ) -> Result<Execution, RemoteTransportError> {
-        let request = grpc_request(message, token, self.config.transport_timeout, traceparent)?;
-        ExecutionServiceClient::new(self.channel.clone())
+        let request = grpc_request(message, token, self.client.config.transport_timeout, traceparent)?;
+        ExecutionServiceClient::new(self.client.channel.clone())
             .start_execution(request)
             .await
             .map(tonic::Response::into_inner)
@@ -437,10 +635,10 @@ impl AgentRtExecutor {
                 execution_id: execution_id.to_owned(),
             },
             token,
-            self.config.transport_timeout,
+            self.client.config.transport_timeout,
             None,
         )?;
-        ExecutionServiceClient::new(self.channel.clone())
+        ExecutionServiceClient::new(self.client.channel.clone())
             .get_execution(request)
             .await
             .map(tonic::Response::into_inner)
@@ -459,15 +657,18 @@ impl AgentRtExecutor {
                 after_revision,
             },
             token,
-            self.config.transport_timeout.saturating_add(self.config.lookup_wait),
+            self.client
+                .config
+                .transport_timeout
+                .saturating_add(self.client.config.lookup_wait),
             None,
         )?;
-        let mut stream = ExecutionServiceClient::new(self.channel.clone())
+        let mut stream = ExecutionServiceClient::new(self.client.channel.clone())
             .watch_execution(request)
             .await
             .map_err(|status| classify_status(&status))?
             .into_inner();
-        match tokio::time::timeout(self.config.lookup_wait, stream.message()).await {
+        match tokio::time::timeout(self.client.config.lookup_wait, stream.message()).await {
             Ok(Ok(Some(record))) => Ok(record),
             Ok(Ok(None)) => self.lookup(execution_id, token).await,
             Ok(Err(status)) => Err(classify_status(&status)),
@@ -479,34 +680,12 @@ impl AgentRtExecutor {
 
     async fn cancel(&self, execution_id: &str, token: &str) -> Result<Execution, RemoteTransportError> {
         cancel_execution(
-            self.channel.clone(),
-            self.config.transport_timeout,
+            self.client.channel.clone(),
+            self.client.config.transport_timeout,
             execution_id.to_owned(),
             token,
         )
         .await
-    }
-
-    fn sign_subject(&self, link: &RemoteExecutionLink) -> Result<String, ToolError> {
-        let now = u64::try_from(unix_seconds_i64()).unwrap_or_default();
-        let claims = SubjectClaims {
-            issuer: self.config.subject_issuer.clone(),
-            audience: self.config.subject_audience.clone(),
-            tenant_id: link.tenant_id.clone(),
-            principal_id: link.principal_id.clone(),
-            issued_at: now,
-            expires_at: now.saturating_add(60),
-            token_id: link.execution_id.clone(),
-        };
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&claims)
-                .map_err(|error| ToolError::Execution(format!("failed to encode subject assertion: {error}")))?,
-        );
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.config.subject_signing_key.expose().as_bytes())
-            .map_err(|_| ToolError::Config("invalid agent-rt subject signing key".to_owned()))?;
-        mac.update(payload.as_bytes());
-        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-        Ok(format!("{payload}.{signature}"))
     }
 }
 
@@ -828,11 +1007,15 @@ impl TryFrom<Execution> for ExecutionOutcome {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum RemoteTransportError {
+    #[error("not found")]
     NotFound,
+    #[error("identity conflict: {0}")]
     Conflict(String),
+    #[error("request rejected ({code:?}): {message}")]
     Rejected { code: Code, message: String },
+    #[error("ambiguous transport outcome: {0}")]
     Ambiguous(String),
 }
 

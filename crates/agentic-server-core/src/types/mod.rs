@@ -1,9 +1,15 @@
+pub mod containers;
 pub mod event;
 pub mod io;
 pub mod messages;
 pub mod request_response;
 pub mod tools;
 
+pub use containers::{
+    Container, ContainerExpiration, ContainerExpirationAnchor, ContainerFile, ContainerFileList, ContainerList,
+    ContainerNetworkPolicy, CreateContainerFileRequest, CreateContainerRequest, DeletedContainer, DeletedContainerFile,
+    ListContainerFilesRequest, ListContainersRequest, ListOrder,
+};
 pub use io::{
     AllowedTool, AllowedToolsMode, CompactionItem, CustomToolCall, CustomToolCallOutputMessage, FunctionTool,
     FunctionToolCall, FunctionToolResultMessage, GatewayCallStatus, InputContent, InputFileContent,

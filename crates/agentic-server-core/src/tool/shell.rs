@@ -6,7 +6,9 @@ use std::time::Duration;
 use agent_rt_control::Command;
 use serde::Deserialize;
 
-use super::agent_rt::{AgentRtExecutor, ExecutionOutcome, ExecutionOutcomeState, RemoteCommand, WorkspaceResolution};
+use super::agent_rt::{
+    AgentRtClient, AgentRtExecutor, ExecutionOutcome, ExecutionOutcomeState, RemoteCommand, WorkspaceResolution,
+};
 use super::{
     GatewayExecutionContext, GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput, ToolType,
 };
@@ -35,6 +37,12 @@ impl AgentRtShellExecutor {
         Ok(Self {
             inner: AgentRtExecutor::new(config, ledger)?,
         })
+    }
+
+    pub(crate) fn from_client(client: AgentRtClient, ledger: RemoteExecutionLedger) -> Self {
+        Self {
+            inner: AgentRtExecutor::from_client(client, ledger),
+        }
     }
 
     async fn execute_remote(

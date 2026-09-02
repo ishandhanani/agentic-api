@@ -215,6 +215,65 @@ where
     .await
 }
 
+async fn postgres_container_schema_ready<'e, E>(executor: E) -> DbResult<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
+    sqlx::query_scalar(
+        "WITH required(column_name, is_nullable) AS ( \
+             VALUES \
+                 ('tenant_id', 'NO'), ('principal_id', 'NO'), ('id', 'NO'), \
+                 ('name', 'NO'), ('workspace_class_id', 'NO'), ('memory_limit', 'NO'), ('status', 'NO'), \
+                 ('expires_after_minutes', 'YES'), ('created_at', 'NO'), \
+                 ('last_active_at', 'NO'), ('expires_at', 'YES'), ('deleted_at', 'YES') \
+         ) \
+         SELECT COUNT(*) = 12 \
+         FROM required \
+         JOIN information_schema.columns actual \
+           ON actual.table_name = 'containers' \
+          AND actual.column_name = required.column_name \
+          AND actual.is_nullable = required.is_nullable \
+         JOIN pg_class table_relation \
+           ON table_relation.relname = actual.table_name \
+          AND table_relation.relkind IN ('r', 'p') \
+          AND pg_table_is_visible(table_relation.oid) \
+         JOIN pg_namespace table_namespace \
+           ON table_namespace.oid = table_relation.relnamespace \
+          AND table_namespace.nspname = actual.table_schema",
+    )
+    .fetch_one(executor)
+    .await
+}
+
+async fn postgres_container_file_schema_ready<'e, E>(executor: E) -> DbResult<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
+    sqlx::query_scalar(
+        "WITH required(column_name, is_nullable) AS ( \
+             VALUES \
+                 ('tenant_id', 'NO'), ('principal_id', 'NO'), ('id', 'NO'), ('container_id', 'NO'), \
+                 ('path', 'NO'), ('source', 'NO'), ('status', 'NO'), ('size_bytes', 'NO'), \
+                 ('created_at', 'NO'), ('deleted_at', 'YES') \
+         ) \
+         SELECT COUNT(*) = 10 \
+         FROM required \
+         JOIN information_schema.columns actual \
+           ON actual.table_name = 'container_files' \
+          AND actual.column_name = required.column_name \
+          AND actual.is_nullable = required.is_nullable \
+         JOIN pg_class table_relation \
+           ON table_relation.relname = actual.table_name \
+          AND table_relation.relkind IN ('r', 'p') \
+          AND pg_table_is_visible(table_relation.oid) \
+         JOIN pg_namespace table_namespace \
+           ON table_namespace.oid = table_relation.relnamespace \
+          AND table_namespace.nspname = actual.table_schema",
+    )
+    .fetch_one(executor)
+    .await
+}
+
 fn validate_required_postgres_schema(
     schema_column_count: i64,
     constraint_count: i64,
@@ -287,6 +346,16 @@ async fn verify_supervisor_managed_postgres_schema(
                 "supervisor-managed PostgreSQL schema is missing the remote execution ledger".into(),
             ));
         }
+        if !postgres_container_schema_ready(&mut *connection).await? {
+            return Err(sqlx::Error::Configuration(
+                "supervisor-managed PostgreSQL schema is missing the container catalog".into(),
+            ));
+        }
+        if !postgres_container_file_schema_ready(&mut *connection).await? {
+            return Err(sqlx::Error::Configuration(
+                "supervisor-managed PostgreSQL schema is missing the container file catalog".into(),
+            ));
+        }
         Ok(())
     }
     .await;
@@ -314,7 +383,10 @@ pub(crate) async fn pin_postgres_persistence_schema(connection: &mut sqlx::AnyCo
          JOIN pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace \
          WHERE table_namespace.nspname = ANY(current_schemas(false)) \
          AND table_relation.relkind IN ('r', 'p', 'v', 'm', 'f') \
-         AND table_relation.relname IN ('_sqlx_migrations', 'conversations', 'items', 'responses', 'remote_executions') \
+         AND table_relation.relname IN ( \
+             '_sqlx_migrations', 'conversations', 'items', 'responses', 'remote_executions', 'containers', \
+             'container_files' \
+         ) \
          ORDER BY table_namespace.nspname::text",
     )
     .fetch_all(&mut *connection)
@@ -390,6 +462,34 @@ pub(crate) async fn verify_persistence_writable(pool: &DbPool) -> DbResult<()> {
         .bind(created_at)
         .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            "INSERT INTO containers (
+                 tenant_id, principal_id, id, name, workspace_class_id, memory_limit, status,
+                 created_at, last_active_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, 'creating', $7, $7)",
+        )
+        .bind("readiness")
+        .bind("readiness")
+        .bind(format!("cntr_{suffix}"))
+        .bind("readiness")
+        .bind("readiness")
+        .bind("1g")
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO container_files (
+                 tenant_id, principal_id, id, container_id, path, source, status, size_bytes, created_at
+             ) VALUES ($1, $2, $3, $4, $5, 'user', 'ready', 0, $6)",
+        )
+        .bind("readiness")
+        .bind("readiness")
+        .bind(format!("cfile_{suffix}"))
+        .bind(format!("cntr_{suffix}"))
+        .bind(format!("/mnt/data/cfile_{suffix}"))
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
         Ok(())
     }
     .await;
@@ -418,10 +518,16 @@ pub(crate) async fn verify_persistence_ready(pool: &DbPool) -> DbResult<()> {
                          ('responses', 'INSERT'), \
                          ('remote_executions', 'SELECT'), \
                          ('remote_executions', 'INSERT'), \
-                         ('remote_executions', 'UPDATE') \
+                         ('remote_executions', 'UPDATE'), \
+                         ('containers', 'SELECT'), \
+                         ('containers', 'INSERT'), \
+                         ('containers', 'UPDATE'), \
+                         ('container_files', 'SELECT'), \
+                         ('container_files', 'INSERT'), \
+                         ('container_files', 'UPDATE') \
                  ) \
                  SELECT current_setting('transaction_read_only') = 'off' \
-                    AND COUNT(table_relation.oid) = 10 \
+                    AND COUNT(table_relation.oid) = 16 \
                     AND COALESCE(BOOL_AND( \
                         has_table_privilege(current_user, table_relation.oid, required.privilege) \
                     ), false) \
@@ -451,6 +557,8 @@ pub(crate) async fn verify_persistence_ready(pool: &DbPool) -> DbResult<()> {
                 "SELECT id FROM items LIMIT 0",
                 "SELECT id FROM responses LIMIT 0",
                 "SELECT execution_id FROM remote_executions LIMIT 0",
+                "SELECT id FROM containers LIMIT 0",
+                "SELECT id FROM container_files LIMIT 0",
             ] {
                 sqlx::query(statement).execute(&mut *connection).await?;
             }

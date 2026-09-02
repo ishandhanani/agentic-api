@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{Config, default_database_url};
+use crate::containers::ContainerService;
 use crate::error::Error;
 use crate::executor::gateway::GatewaySchedulerPolicy;
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
@@ -10,6 +11,7 @@ use crate::storage::{
     ConversationStore, ConversationVersion, DatabaseBackend, ResponseStore, create_pool_with_schema_and_configs,
 };
 use crate::tool::AuthenticatedSubject;
+use crate::tool::agent_rt::AgentRtClient;
 use crate::tool::{AgentRtShellExecutor, GatewayExecutorRegistration, GatewayExecutors};
 use crate::types::io::InputItem;
 use crate::types::messages::GatewayToolMap;
@@ -79,6 +81,7 @@ pub struct ExecutionContext {
     pub(crate) gateway_scheduler_policy: GatewaySchedulerPolicy,
     storage_pool: Option<Arc<crate::storage::DbPool>>,
     remote_default_subject: Option<AuthenticatedSubject>,
+    container_service: Option<ContainerService>,
 }
 
 impl ExecutionContext {
@@ -113,6 +116,7 @@ impl ExecutionContext {
             gateway_scheduler_policy: GatewaySchedulerPolicy::default(),
             storage_pool: None,
             remote_default_subject: None,
+            container_service: None,
         }
     }
 
@@ -150,6 +154,12 @@ impl ExecutionContext {
         Some(subject)
     }
 
+    /// Returns the configured `OpenAI` Containers adapter over agent-rt.
+    #[must_use]
+    pub fn container_service(&self) -> Option<&ContainerService> {
+        self.container_service.as_ref()
+    }
+
     /// Build an `ExecutionContext` directly from [`Config`](crate::config::Config).
     ///
     /// Creates the database pool, both storage handlers, and an HTTP client
@@ -180,11 +190,20 @@ impl ExecutionContext {
         let client = Arc::new(reqwest::Client::new());
         let mut gateway_executors = GatewayExecutors::from_config(Arc::clone(&client), &cfg.tools)
             .map_err(|error| Error::Config(format!("failed to validate configured tool executors: {error}")))?;
+        let mut container_service = None;
         if let Some(agent_rt) = cfg.tools.agent_rt.clone() {
-            let executor =
-                AgentRtShellExecutor::new(agent_rt, crate::storage::RemoteExecutionLedger::new(pool.clone()))
-                    .map_err(|error| Error::Config(format!("failed to configure agent-rt executor: {error}")))?;
+            let client = AgentRtClient::new(agent_rt)
+                .map_err(|error| Error::Config(format!("failed to configure agent-rt client: {error}")))?;
+            let executor = AgentRtShellExecutor::from_client(
+                client.clone(),
+                crate::storage::RemoteExecutionLedger::new(pool.clone()),
+            );
             gateway_executors.register(Arc::new(executor));
+            container_service = Some(ContainerService::new(
+                client,
+                crate::storage::ContainerStore::new(pool.clone()),
+                crate::storage::ContainerFileStore::new(pool.clone()),
+            ));
         }
         Ok(Self {
             conv_handler,
@@ -217,6 +236,7 @@ impl ExecutionContext {
                 tenant_id: config.tenant_id.clone(),
                 principal_id: config.default_principal_id.clone(),
             }),
+            container_service,
         })
     }
 }

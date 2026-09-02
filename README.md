@@ -67,6 +67,7 @@ flowchart LR
 | `POST /v1/responses` | OpenAI-compatible Responses API with state, tools, and streaming | ✅ |
 | `GET /v1/responses` | WebSocket transport for the Responses API | ✅ |
 | `POST /v1/conversations` | Conversation management | ✅ |
+| `/v1/containers` · `/v1/containers/{id}/files` | Container lifecycle and file I/O through a configured agent-rt service | 🚧 Policy bindings |
 | `GET /v1/models` | Model listing proxied from vLLM | ✅ |
 | `GET /health` · `GET /ready` | Liveness and readiness probes | ✅ |
 | Messages API | Anthropic-style stateful messages on shared primitives | 🚧 Planned |

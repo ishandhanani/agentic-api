@@ -3,7 +3,7 @@
 //! Wire format types (`ResponsesTool`, param structs) live in [`crate::types::tools`].
 //! This module owns the behavioral layer: routing, handler interface, and normalization.
 
-mod agent_rt;
+pub(crate) mod agent_rt;
 pub mod codex;
 pub mod custom;
 pub mod executors;
