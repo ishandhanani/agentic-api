@@ -30,6 +30,13 @@ service ArtifactService {
   rpc ReadArtifact(ReadArtifactRequest) returns (stream ArtifactChunk);
 }
 
+// Advisory demand ingestion for the independent capacity planner. Reports are
+// authenticated and resolve operator-owned routes; provider and pool identity
+// never appear in this caller-facing contract.
+service CapacityService {
+  rpc ReportCapacityIntent(ReportCapacityIntentRequest) returns (CapacityIntent);
+}
+
 message CreateWorkspaceRequest {
   string workspace_id = 1;
   string workspace_class_id = 2;
@@ -217,4 +224,26 @@ message ArtifactChunk {
   bytes data = 1;
   uint64 offset = 2;
   bool eof = 3;
+}
+
+message ReportCapacityIntentRequest {
+  string source_id = 1;
+  string route_id = 2;
+  uint64 slots = 3;
+  uint32 confidence_per_million = 4;
+  uint64 ready_by_unix_millis = 5;
+  uint64 expires_at_unix_millis = 6;
+  uint64 expected_duration_millis = 7;
+}
+
+message CapacityIntent {
+  string source_id = 1;
+  string route_id = 2;
+  uint64 slots = 3;
+  uint32 confidence_per_million = 4;
+  uint64 ready_by_unix_millis = 5;
+  uint64 expires_at_unix_millis = 6;
+  uint64 expected_duration_millis = 7;
+  uint64 revision = 8;
+  uint64 accepted_at_unix_millis = 9;
 }
