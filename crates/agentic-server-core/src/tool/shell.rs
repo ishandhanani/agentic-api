@@ -60,6 +60,7 @@ impl AgentRtShellExecutor {
             .map(|command| RemoteCommand {
                 command: Command {
                     argv: vec!["sh".to_owned(), "-lc".to_owned(), command],
+                    user: None,
                     cwd: None,
                     env: HashMap::new(),
                     stdin: Vec::new(),

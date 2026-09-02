@@ -204,6 +204,7 @@ impl AgentRtClient {
             StatFileRequest {
                 workspace_id: workspace_id.to_owned(),
                 path: path.to_owned(),
+                user: None,
             },
             token,
             self.config.transport_timeout,
@@ -231,6 +232,7 @@ impl AgentRtClient {
                 path: path.to_owned(),
                 offset,
                 max_bytes,
+                user: None,
             },
             token,
             self.config.transport_timeout,
@@ -257,6 +259,7 @@ impl AgentRtClient {
             offset: write.offset,
             data: write.data,
             truncate: write.truncate,
+            user: None,
         };
         let execute = || async {
             let request = grpc_request(message.clone(), token, self.config.transport_timeout, traceparent)?;
@@ -285,6 +288,7 @@ impl AgentRtClient {
                 workspace_id: workspace_id.to_owned(),
                 path: path.to_owned(),
                 recursive: false,
+                user: None,
             },
             token,
             self.config.transport_timeout,
@@ -1031,6 +1035,7 @@ mod tests {
         RemoteCommand {
             command: Command {
                 argv: vec!["python".to_owned(), "-c".to_owned(), source.to_owned()],
+                user: None,
                 cwd: None,
                 env: HashMap::new(),
                 stdin: Vec::new(),

@@ -87,6 +87,9 @@ message Command {
   map<string, string> env = 3;
   bytes stdin = 4;
   repeated string artifact_paths = 5;
+  // Logical workspace user selected from the operator-owned workspace class.
+  // When absent, the class/provider default is used.
+  optional string user = 6;
 }
 
 message ExecutionLimits {
@@ -141,11 +144,13 @@ message ExecutionResult {
 message StatFileRequest {
   string workspace_id = 1;
   string path = 2;
+  optional string user = 3;
 }
 
 message ListFilesRequest {
   string workspace_id = 1;
   string path = 2;
+  optional string user = 3;
 }
 
 message ListFilesResponse {
@@ -157,6 +162,7 @@ message ReadFileRequest {
   string path = 2;
   uint64 offset = 3;
   uint64 max_bytes = 4;
+  optional string user = 5;
 }
 
 message FileChunk {
@@ -171,12 +177,14 @@ message WriteFileRequest {
   uint64 offset = 3;
   bytes data = 4;
   bool truncate = 5;
+  optional string user = 6;
 }
 
 message RemoveFileRequest {
   string workspace_id = 1;
   string path = 2;
   bool recursive = 3;
+  optional string user = 4;
 }
 
 message RemoveFileResponse {}
