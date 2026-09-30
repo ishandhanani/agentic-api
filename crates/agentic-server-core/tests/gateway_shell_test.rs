@@ -118,6 +118,7 @@ fn policy(principal: &str, view: ShellClientView, declare: Option<&str>) -> Arc<
             client_view: view,
         }),
         correlation: BTreeMap::from([("session_id".to_owned(), "thread-1".to_owned())]),
+        upstream_headers: BTreeMap::from([("x-dynamo-session-id".to_owned(), "thread-1".to_owned())]),
     })
 }
 

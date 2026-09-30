@@ -51,6 +51,9 @@ pub struct GatewayExecutionPolicy {
     /// Opaque correlation (session, thread, turn) forwarded to backends for
     /// tracing and workspace naming. It is never authorization.
     pub correlation: BTreeMap<String, String>,
+    /// Headers the deployment attaches to every inference request for this
+    /// caller, for example a session identity the inference service traces.
+    pub upstream_headers: BTreeMap<String, String>,
 }
 
 /// Grant allowing gateway execution of hosted `shell` environments.
