@@ -102,6 +102,7 @@ fn shell_added_frame(call: &AccumulatedFunctionCall<'_>) -> ExecutorResult<Event
                     extra: HashMap::new(),
                 },
                 extra: HashMap::new(),
+                origin: crate::types::io::ShellItemOrigin::Client,
             }))?,
         )],
     )

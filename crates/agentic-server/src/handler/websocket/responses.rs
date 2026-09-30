@@ -23,6 +23,7 @@ use super::super::common::extract_bearer;
 use super::error::WsError;
 use crate::app::AppState;
 use crate::auth::AuthenticatedPrincipal;
+use agentic_core::tool::GatewayExecutionPolicy;
 
 mod event;
 mod local;
@@ -126,6 +127,7 @@ struct WsMultiplexer {
     state: Arc<AppState>,
     auth: Option<String>,
     principal: Option<Arc<AuthenticatedPrincipal>>,
+    execution_policy: Option<Arc<GatewayExecutionPolicy>>,
     outbound_tx: mpsc::Sender<WsOutboundEvent>,
     lanes: HashMap<Option<StreamId>, VecDeque<WsWorkItem>>,
     // Idle lanes retain their latest checkpoint until the connection closes.
@@ -142,6 +144,7 @@ impl WsMultiplexer {
         state: Arc<AppState>,
         auth: Option<String>,
         principal: Option<AuthenticatedPrincipal>,
+        execution_policy: Option<Arc<GatewayExecutionPolicy>>,
         outbound_tx: mpsc::Sender<WsOutboundEvent>,
         shutdown_token: CancellationToken,
     ) -> Self {
@@ -149,6 +152,7 @@ impl WsMultiplexer {
             state,
             auth,
             principal: principal.map(Arc::new),
+            execution_policy,
             outbound_tx,
             lanes: HashMap::new(),
             sessions: HashMap::new(),
@@ -266,6 +270,7 @@ impl WsMultiplexer {
         let state = Arc::clone(&self.state);
         let auth = self.auth.clone();
         let principal = self.principal.clone();
+        let execution_policy = self.execution_policy.clone();
         let outbound_tx = self.outbound_tx.clone();
         let shutdown_token = self.shutdown_token.clone();
         let stream_id = work.stream_id().cloned();
@@ -288,7 +293,7 @@ impl WsMultiplexer {
                     handle_ws_request(
                         *request,
                         &state,
-                        auth,
+                        WsCaller { auth, execution_policy },
                         &outbound_tx,
                         &shutdown_token,
                         &session,
@@ -327,16 +332,23 @@ impl WsMultiplexer {
 }
 
 pub async fn responses_ws(State(state): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    upgrade_responses_ws(state, headers, ws, None)
+    upgrade_responses_ws(state, headers, ws, None, None)
 }
 
 pub(crate) async fn responses_ws_with_auth(
     State(state): State<AppState>,
     principal: Option<Extension<AuthenticatedPrincipal>>,
+    execution_policy: Option<Extension<Arc<GatewayExecutionPolicy>>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    upgrade_responses_ws(state, headers, ws, principal.map(|Extension(principal)| principal))
+    upgrade_responses_ws(
+        state,
+        headers,
+        ws,
+        principal.map(|Extension(principal)| principal),
+        execution_policy.map(|Extension(policy)| policy),
+    )
 }
 
 fn upgrade_responses_ws(
@@ -344,6 +356,7 @@ fn upgrade_responses_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
     principal: Option<AuthenticatedPrincipal>,
+    execution_policy: Option<Arc<GatewayExecutionPolicy>>,
 ) -> Response {
     let websocket_guard = state.websocket_tracker.track();
     // Read before `state` moves into the upgrade closure. Messages and frames
@@ -354,7 +367,7 @@ fn upgrade_responses_ws(
         .max_frame_size(max_request_body_size)
         .on_upgrade(move |socket| async move {
             let _websocket_guard = websocket_guard;
-            Box::pin(responses_ws_loop(socket, state, headers, principal)).await;
+            Box::pin(responses_ws_loop(socket, state, headers, principal, execution_policy)).await;
         })
 }
 
@@ -373,6 +386,7 @@ async fn responses_ws_loop(
     state: AppState,
     headers: HeaderMap,
     principal: Option<AuthenticatedPrincipal>,
+    execution_policy: Option<Arc<GatewayExecutionPolicy>>,
 ) {
     debug!("responses websocket session opened");
     let shutdown_token = state.shutdown_token.clone();
@@ -380,7 +394,14 @@ async fn responses_ws_loop(
     let (mut sender, mut receiver) = socket.split();
     let auth = extract_bearer(&headers, state.openai_api_key.as_deref());
     let (outbound_tx, mut outbound_rx) = mpsc::channel(WS_OUTBOUND_BUFFER);
-    let mut multiplexer = WsMultiplexer::new(state, auth, principal, outbound_tx, shutdown_token.clone());
+    let mut multiplexer = WsMultiplexer::new(
+        state,
+        auth,
+        principal,
+        execution_policy,
+        outbound_tx,
+        shutdown_token.clone(),
+    );
     let mut draining = false;
     let mut client_disconnected = false;
 
@@ -645,10 +666,16 @@ fn parse_ws_request(text: &str) -> Result<WsRequest, WsRequestParseError> {
     })
 }
 
+/// Credentials and trusted execution policy of the connected caller.
+struct WsCaller {
+    auth: Option<String>,
+    execution_policy: Option<Arc<GatewayExecutionPolicy>>,
+}
+
 async fn handle_ws_request(
     request: WsRequest,
     state: &AppState,
-    auth: Option<String>,
+    caller: WsCaller,
     outbound_tx: &mpsc::Sender<WsOutboundEvent>,
     shutdown_token: &CancellationToken,
     session: &ResponseSession,
@@ -676,7 +703,8 @@ async fn handle_ws_request(
     // metadata is attached, and does so before persisting the response.
     let result = ExecuteRequest::new(payload, Arc::clone(&state.exec_ctx))
         .with_execution_span(execution)
-        .with_auth(auth)
+        .with_auth(caller.auth)
+        .with_execution_policy(caller.execution_policy)
         .with_session(session)?
         .with_max_stream_event_bytes(event_limit.executor_limit(stream_id.as_ref()))
         .run()

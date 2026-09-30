@@ -29,7 +29,7 @@ pub use output::{
 };
 pub use shell::{
     ShellCall, ShellCallAction, ShellCallLimit, ShellCallOutcome, ShellCallOutputContent, ShellCallOutputMessage,
-    ShellCallStatus,
+    ShellCallStatus, ShellItemOrigin,
 };
 pub use tools::{AllowedTool, AllowedToolsMode, FunctionTool, ToolChoice};
 pub(crate) use tools::{resolve_tool_choice, resolve_tools};

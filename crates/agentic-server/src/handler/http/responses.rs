@@ -11,7 +11,7 @@ use std::sync::Arc;
 use agentic_core::executor::telemetry::Api;
 use agentic_core::executor::{ExecuteRequest, compact_response as execute_compaction};
 use agentic_core::proxy::ProxyRequest;
-use agentic_core::tool::ToolSearchHandler;
+use agentic_core::tool::{GatewayExecutionPolicy, ToolSearchHandler};
 use agentic_core::types::request_response::{CompactRequest, RequestPayload, ResponseTextConfig};
 
 use super::super::common::{
@@ -35,8 +35,10 @@ async fn proxy_responses(state: &AppState, parts: Parts, body: Bytes) -> Respons
 
 async fn execute_responses(state: &AppState, parts: Parts, payload: RequestPayload) -> Response {
     let auth = extract_bearer(&parts.headers, state.openai_api_key.as_deref());
+    let execution_policy = parts.extensions.get::<Arc<GatewayExecutionPolicy>>().cloned();
     match ExecuteRequest::new(payload, Arc::clone(&state.exec_ctx))
         .with_auth(auth)
+        .with_execution_policy(execution_policy)
         .run()
         .await
     {
@@ -74,9 +76,17 @@ pub async fn responses(State(state): State<AppState>, req: Request) -> Response 
     };
 
     let has_tool_search_state = ToolSearchHandler::request_has_state(&routing_payload);
+    // A trusted gateway shell grant or replayed gateway shell history needs the
+    // executor even when the body itself looks like a plain proxy request.
+    let gateway_shell = parts
+        .extensions
+        .get::<Arc<GatewayExecutionPolicy>>()
+        .is_some_and(|policy| policy.shell.as_ref().is_some_and(|grant| grant.declare.is_some()))
+        || routing_payload.has_sealed_shell_history();
     let should_execute = routing_payload.store
         || routing_payload.previous_response_id.is_some()
         || has_tool_search_state
+        || gateway_shell
         || routing_payload.in_process_feature().is_some();
     debug!(
         route = if should_execute { "executor" } else { "proxy" },

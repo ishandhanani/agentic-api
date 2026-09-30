@@ -91,7 +91,11 @@ struct CodexModelInfo {
     support_verbosity: bool,
     /// Always null: the gateway does not advertise a verbosity default.
     default_verbosity: Option<String>,
-    apply_patch_tool_type: &'static str,
+    /// Omitted when the deployment executes shell itself: once gateway tools
+    /// are present the gateway normalizes the tool list, which Codex's freeform
+    /// `apply_patch` cannot survive, so Codex edits through the shell instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apply_patch_tool_type: Option<&'static str>,
     web_search_tool_type: &'static str,
     truncation_policy: TruncationPolicy,
     supports_parallel_tool_calls: bool,
@@ -141,7 +145,7 @@ impl Default for CodexModelInfo {
             default_reasoning_summary: "auto",
             support_verbosity: false,
             default_verbosity: None,
-            apply_patch_tool_type: "freeform",
+            apply_patch_tool_type: Some("freeform"),
             web_search_tool_type: "text",
             truncation_policy: TruncationPolicy {
                 mode: TruncationMode::Bytes,
@@ -198,6 +202,7 @@ fn upstream_model_to_codex(model: &UpstreamModel, capabilities: &ModelCapabiliti
 fn build_codex_models_response(
     upstream_bytes: &[u8],
     capabilities: &ModelCapabilities,
+    gateway_shell: bool,
 ) -> Result<CodexModelsResponse, serde_json::Error> {
     let upstream: UpstreamModelList = serde_json::from_slice(upstream_bytes)?;
 
@@ -206,6 +211,12 @@ fn build_codex_models_response(
             .data
             .iter()
             .filter_map(|model| upstream_model_to_codex(model, capabilities))
+            .map(|mut model| {
+                if gateway_shell {
+                    model.apply_patch_tool_type = None;
+                }
+                model
+            })
             .collect(),
     })
 }
@@ -384,7 +395,8 @@ pub async fn models(State(state): State<AppState>, headers: HeaderMap, Query(par
         });
     }
 
-    match build_codex_models_response(&upstream_bytes, &state.model_capabilities) {
+    let gateway_shell = state.exec_ctx.gateway_executors.shell_executor().is_some();
+    match build_codex_models_response(&upstream_bytes, &state.model_capabilities, gateway_shell) {
         Ok(response) => axum::Json(response).into_response(),
         Err(error) => {
             warn!(error = %error, "upstream /v1/models payload could not be decoded");
@@ -427,7 +439,7 @@ mod tests {
     }
 
     fn catalog(payload: &str, capabilities: &ModelCapabilities) -> Vec<Value> {
-        let response = build_codex_models_response(payload.as_bytes(), capabilities).expect("decodable payload");
+        let response = build_codex_models_response(payload.as_bytes(), capabilities, false).expect("decodable payload");
         let serialized = serde_json::to_value(&response).expect("serialize catalog");
         serialized["models"].as_array().cloned().expect("models array")
     }
@@ -512,6 +524,17 @@ mod tests {
                 {"effort": "high", "description": "Greater reasoning depth for complex problems"}
             ])
         );
+    }
+
+    #[test]
+    fn catalog_omits_freeform_apply_patch_when_the_gateway_runs_shell() {
+        let response = build_codex_models_response(UPSTREAM_MODELS.as_bytes(), &configured_capabilities(), true)
+            .expect("decodable payload");
+        let serialized = serde_json::to_value(&response).expect("serialize catalog");
+        let model = entry(serialized["models"].as_array().expect("models array"), "vision-model");
+
+        assert!(model.get("apply_patch_tool_type").is_none());
+        assert_eq!(model["shell_type"], json!("shell_command"));
     }
 
     #[test]
@@ -628,7 +651,7 @@ mod tests {
             r#"{"data": [{"id": "a-model", "max_model_len": "32k"}]}"#,
         ] {
             assert!(
-                build_codex_models_response(payload.as_bytes(), &ModelCapabilities::default()).is_err(),
+                build_codex_models_response(payload.as_bytes(), &ModelCapabilities::default(), false).is_err(),
                 "{payload} must not be served as an empty catalog"
             );
         }

@@ -13,6 +13,9 @@ use crate::config::ToolRuntimeConfig;
 use crate::types::tools::{McpToolParam, ResponsesTool};
 
 use super::code_interpreter::CodeInterpreterExecutor;
+use super::gateway_shell::{GatewayExecutionPolicy, GatewayShellConfig, GatewayShellExecutor};
+use super::ownership::GatewayBinding;
+use crate::types::tools::ShellToolParam;
 
 pub enum GatewayExecutorRegistration {
     WebSearch(Arc<WebSearchExecutor>),
@@ -20,6 +23,26 @@ pub enum GatewayExecutorRegistration {
         server_label: String,
         handlers: Vec<McpDiscoveredHandler>,
     },
+    /// Deployment-provided backend for hosted `shell` environments. It only
+    /// executes calls whose request carries a trusted shell grant.
+    Shell(Arc<GatewayShellExecutor>),
+}
+
+impl GatewayExecutorRegistration {
+    /// Validates and wraps a shell backend registration.
+    ///
+    /// # Errors
+    /// Rejects weak sealing keys and invalid limits.
+    pub fn shell(config: GatewayShellConfig) -> Result<Self, ToolError> {
+        Ok(Self::Shell(Arc::new(GatewayShellExecutor::new(config)?)))
+    }
+}
+
+/// Trusted request facts that request-scoped executors need.
+#[derive(Clone, Debug)]
+struct RequestScope {
+    policy: Option<Arc<GatewayExecutionPolicy>>,
+    response_id: String,
 }
 
 impl<T> From<Arc<T>> for GatewayExecutorRegistration
@@ -55,6 +78,8 @@ pub struct GatewayExecutors {
     web_search: Option<Arc<WebSearchExecutor>>,
     /// Present only after an opted-in provider passes startup readiness checks.
     code_interpreter: Option<Arc<CodeInterpreterExecutor>>,
+    shell: Option<Arc<GatewayShellExecutor>>,
+    request: Option<RequestScope>,
 }
 
 impl GatewayExecutors {
@@ -68,6 +93,8 @@ impl GatewayExecutors {
             mcp_allowed_hosts: super::mcp::pool::allowed_hosts_from_env(),
             web_search: Some(Arc::new(WebSearchHandler::from_env(client))),
             code_interpreter: None,
+            shell: None,
+            request: None,
         }
     }
 
@@ -111,6 +138,8 @@ impl GatewayExecutors {
                 config.max_concurrent_gateway_calls,
             ))),
             code_interpreter,
+            shell: None,
+            request: None,
         };
         if config.mcp_servers.is_empty() {
             return Ok(executors);
@@ -139,6 +168,7 @@ impl GatewayExecutors {
                     tracing::debug!(server_label, "replaced MCP discovered handler registration");
                 }
             }
+            GatewayExecutorRegistration::Shell(executor) => self.shell = Some(executor),
         }
     }
 
@@ -153,8 +183,43 @@ impl GatewayExecutors {
     }
 
     #[must_use]
-    pub(crate) fn request_scoped(&self) -> Self {
-        self.clone()
+    pub(crate) fn request_scoped(&self, policy: Option<Arc<GatewayExecutionPolicy>>, response_id: &str) -> Self {
+        let mut scoped = self.clone();
+        scoped.request = Some(RequestScope {
+            policy,
+            response_id: response_id.to_owned(),
+        });
+        scoped
+    }
+
+    /// The registered gateway shell executor, if any.
+    #[must_use]
+    pub fn shell_executor(&self) -> Option<&Arc<GatewayShellExecutor>> {
+        self.shell.as_ref()
+    }
+
+    /// Binds a hosted `shell` declaration to the trusted request policy after
+    /// the backend authorizes its environment. Fails before inference when
+    /// any part of the grant is missing.
+    pub(crate) async fn shell_binding(&self, param: &ShellToolParam) -> Result<GatewayBinding, ToolError> {
+        let executor = self.shell.as_ref().ok_or_else(|| {
+            ToolError::Config("hosted shell environments require a configured gateway shell backend".to_owned())
+        })?;
+        let scope = self
+            .request
+            .as_ref()
+            .ok_or_else(|| ToolError::Config("hosted shell requires a request-scoped registry".to_owned()))?;
+        let policy = scope.policy.as_ref().ok_or_else(|| {
+            ToolError::Config("hosted shell environments require an authenticated execution policy".to_owned())
+        })?;
+        let grant = policy
+            .shell
+            .as_ref()
+            .ok_or_else(|| ToolError::Config("this caller is not granted gateway shell execution".to_owned()))?;
+        let binding = executor
+            .bind(policy, grant, &param.environment, &scope.response_id)
+            .await?;
+        Ok(GatewayBinding::new(Arc::clone(executor), binding))
     }
 
     /// Validates request declarations against the executors that actually
@@ -170,6 +235,15 @@ impl GatewayExecutors {
         CodeInterpreterHandler::validate_declarations(tools)?;
         for tool in tools {
             tool.validate()?;
+        }
+        if self.shell.is_none()
+            && tools
+                .iter()
+                .any(|tool| matches!(tool, ResponsesTool::Shell(param) if param.environment.is_hosted()))
+        {
+            return Err(ToolError::Config(
+                "hosted shell environments require a configured gateway shell backend".to_owned(),
+            ));
         }
         if tools
             .iter()
@@ -362,6 +436,8 @@ impl std::fmt::Debug for GatewayExecutors {
             .field("mcp_allowed_hosts", &self.mcp_allowed_hosts)
             .field("web_search", &self.web_search.is_some());
         debug.field("code_interpreter", &self.code_interpreter.is_some());
+        debug.field("shell", &self.shell.is_some());
+        debug.field("request_scoped", &self.request.is_some());
         debug.finish()
     }
 }

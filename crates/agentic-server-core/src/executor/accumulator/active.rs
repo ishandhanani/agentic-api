@@ -316,7 +316,7 @@ impl ActiveItem {
             OutputItem::MultiAgentCall(item) => Self::MultiAgentCall { item },
             OutputItem::MultiAgentCallOutput(item) => Self::MultiAgentCallOutput { item },
             OutputItem::AgentMessage(item) => Self::AgentMessage(AgentMessageState::new(item)),
-            OutputItem::Unknown => return None,
+            OutputItem::ShellCallOutput(_) | OutputItem::Unknown => return None,
         })
     }
 

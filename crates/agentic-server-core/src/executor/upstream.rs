@@ -131,12 +131,14 @@ pub(super) async fn fetch_blocking_payload(
 ) -> ExecutorResult<ResponsePayload> {
     agent.ensure_request_prepared()?;
     let upstream_json = upstream_request_with_guidance(&agent.request, false, agent.agent_guidance())?;
+    let headers = inference_headers(&agent.request);
     let body = fetch_response_json_limited(
         upstream_json,
         &exec_ctx.responses_url(),
         &exec_ctx.client,
         auth,
         exec_ctx.responses_config.max_upstream_json_bytes,
+        headers.as_ref(),
     )
     .await?;
     agent.run_with_json_body(
@@ -204,6 +206,7 @@ pub(super) async fn fetch_stream_payload(
         auth.map(str::to_owned),
         exec_ctx.streaming_timeout,
         exec_ctx.responses_config.max_upstream_sse_line_bytes,
+        inference_headers(&agent.request),
     );
     agent
         .run_with_stream_body(
@@ -215,6 +218,34 @@ pub(super) async fn fetch_stream_payload(
             Some(response_budget.clone()),
         )
         .await
+}
+
+/// Correlation headers for one inference request of a policy-bearing request:
+/// the deployment's upstream headers plus an `x-request-id` that ties the
+/// inference service's trace record to this response.
+fn inference_headers(ctx: &crate::executor::request::RequestContext) -> Option<reqwest::header::HeaderMap> {
+    let policy = ctx.enriched_request.execution_policy.as_ref()?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in &policy.upstream_headers {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    let request_id = format!("{}/{}", ctx.response_id, crate::utils::uuid7_str("inf_"));
+    tracing::info!(
+        target: "agentic::inference",
+        response_id = %ctx.response_id,
+        x_request_id = %request_id,
+        session_id = policy.correlation.get("session_id").map_or("", String::as_str),
+        "inference request"
+    );
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&request_id) {
+        headers.insert("x-request-id", value);
+    }
+    Some(headers)
 }
 
 #[cfg(test)]

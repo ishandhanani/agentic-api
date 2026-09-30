@@ -109,6 +109,28 @@ pub trait GatewayExecutor: ToolHandler + 'static {
         params: &Self::ExecutionParams,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>>;
 
+    /// Whether this executor enforces its own deadline. When `true` the
+    /// scheduler's generic per-call timeout is not applied; the executor must
+    /// bound its work and release or cancel remote work itself.
+    #[must_use]
+    fn manages_own_deadline(&self) -> bool {
+        false
+    }
+
+    /// Additional public items emitted after this round's items, for tools
+    /// whose protocol pairs a call item with a separate output item.
+    #[must_use]
+    fn trailing_public_outputs(
+        &self,
+        call: &FunctionToolCall,
+        output: &ToolOutput,
+        status: GatewayCallStatus,
+        params: &Self::ExecutionParams,
+    ) -> Vec<OutputItem> {
+        let _ = (call, output, status, params);
+        Vec::new()
+    }
+
     /// Whether multiple calls to this same model-visible tool name may overlap.
     /// Defaults to `false`, which serializes only same-name calls; calls to
     /// different tools may still execute concurrently in the same round.

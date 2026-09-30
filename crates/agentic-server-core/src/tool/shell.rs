@@ -33,6 +33,7 @@ impl ShellHandler {
             action,
             status: Some(status),
             extra: HashMap::new(),
+            origin: crate::types::io::ShellItemOrigin::Client,
         }))
     }
 }
@@ -45,9 +46,11 @@ impl ToolHandler for ShellHandler {
     }
 
     fn validate(&self, params: &ShellToolParam) -> Result<(), ToolError> {
-        if !matches!(params.environment, ShellEnvironment::Local(_)) {
+        // Hosted environments are accepted here only as declarations; the
+        // registry executes them solely under a trusted gateway shell grant.
+        if matches!(params.environment, ShellEnvironment::Unknown(_)) {
             return Err(ToolError::Config(
-                "shell tool currently supports only environment.type='local'".to_owned(),
+                "shell tool supports environment.type 'local', 'container_auto', or 'container_reference'".to_owned(),
             ));
         }
         Ok(())
@@ -149,7 +152,7 @@ mod tests {
     #[test]
     fn unknown_shell_environment_is_rejected() {
         let param = serde_json::from_value::<ShellToolParam>(serde_json::json!({
-            "environment": {"type": "container_auto"}
+            "environment": {"type": "future_environment"}
         }))
         .expect("preserved unknown environment");
         assert!(ShellHandler.validate(&param).is_err());

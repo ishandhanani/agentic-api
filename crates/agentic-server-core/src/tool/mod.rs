@@ -8,6 +8,7 @@ pub mod codex;
 pub mod custom;
 pub mod executors;
 pub mod function;
+pub mod gateway_shell;
 pub mod handler;
 pub mod mcp;
 pub mod normalize;
@@ -22,6 +23,12 @@ pub use codex::{CodexNamespaceHandler, NamespaceMap, model_visible_namespace_mem
 pub use custom::CustomHandler;
 pub use executors::{GatewayExecutorRegistration, GatewayExecutors};
 pub use function::FunctionHandler;
+pub use gateway_shell::{
+    ExecutionSubject, GatewayExecutionPolicy, GatewayShellBinding, GatewayShellConfig, GatewayShellExecutor,
+    GatewayShellGrant, PreparedShellEnvironment, ShellBackend, ShellBackendContext, ShellBackendError,
+    ShellBackendFuture, ShellClientView, ShellCommandOutcome, ShellCommandRequest, ShellCommandResult,
+    ShellEnvironmentSelection, ShellExecutionLimits,
+};
 pub use handler::{GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput};
 pub use mcp::{McpClient, McpClientPool, McpDiscoveredHandler, McpError, McpHandler, McpOperation, McpServerEntry};
 pub use ownership::{GatewayBinding, ToolOwnership};

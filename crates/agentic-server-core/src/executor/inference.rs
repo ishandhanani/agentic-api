@@ -196,7 +196,7 @@ pub(super) async fn fetch_response_json(
     client: &reqwest::Client,
     auth: Option<&str>,
 ) -> ExecutorResult<String> {
-    fetch_response_json_limited(upstream_json, url, client, auth, DEFAULT_MAX_UPSTREAM_JSON_BYTES).await
+    fetch_response_json_limited(upstream_json, url, client, auth, DEFAULT_MAX_UPSTREAM_JSON_BYTES, None).await
 }
 
 pub(super) async fn fetch_response_json_limited(
@@ -205,8 +205,9 @@ pub(super) async fn fetch_response_json_limited(
     client: &reqwest::Client,
     auth: Option<&str>,
     max_upstream_json_bytes: usize,
+    forwarded_headers: Option<&reqwest::header::HeaderMap>,
 ) -> ExecutorResult<String> {
-    let resp = send_request(client, url, upstream_json, auth, None, Duration::ZERO).await?;
+    let resp = send_request(client, url, upstream_json, auth, forwarded_headers, Duration::ZERO).await?;
     // Preserve the reqwest::Error as the typed source (NetworkError).
     response_text_limited(resp, Duration::ZERO, max_upstream_json_bytes).await
 }
@@ -248,6 +249,7 @@ pub fn call_inference(
         auth,
         chunk_timeout,
         DEFAULT_MAX_UPSTREAM_SSE_LINE_BYTES,
+        None,
     )
 }
 
@@ -258,6 +260,7 @@ pub fn call_inference_limited(
     auth: Option<String>,
     chunk_timeout: Duration,
     max_sse_line_bytes: usize,
+    forwarded_headers: Option<reqwest::header::HeaderMap>,
 ) -> impl Stream<Item = Result<String, ExecutorError>> + Send + 'static {
     stream! {
         let resp = match send_request(
@@ -265,7 +268,7 @@ pub fn call_inference_limited(
             &url,
             upstream_json,
             auth.as_deref(),
-            None,
+            forwarded_headers.as_ref(),
             chunk_timeout,
         ).await {
             Ok(r) => r,

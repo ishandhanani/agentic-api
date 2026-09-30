@@ -334,11 +334,42 @@ pub struct ShellToolParam {
 }
 
 /// Environment in which shell calls are executed.
+///
+/// `local` is always client-executed. The hosted environments are executed
+/// by the gateway only when a deployment registers a shell backend and the
+/// request carries a trusted execution policy that grants shell execution.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ShellEnvironment {
     Local(LocalShellEnvironment),
+    ContainerAuto(ContainerAutoShellEnvironment),
+    ContainerReference(ContainerReferenceShellEnvironment),
     Unknown(Value),
+}
+
+impl ShellEnvironment {
+    /// Whether this environment is hosted by the gateway rather than the caller.
+    #[must_use]
+    pub const fn is_hosted(&self) -> bool {
+        matches!(self, Self::ContainerAuto(_) | Self::ContainerReference(_))
+    }
+}
+
+/// A gateway-provisioned environment chosen by the deployment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ContainerAutoShellEnvironment {
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// An existing gateway environment the caller is authorized to reuse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ContainerReferenceShellEnvironment {
+    pub container_id: String,
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[cfg(feature = "openapi")]
@@ -354,7 +385,7 @@ impl utoipa::PartialSchema for ShellEnvironment {
                         "type",
                         ObjectBuilder::new()
                             .schema_type(SchemaType::new(Type::String))
-                            .enum_values(Some(["local"])),
+                            .enum_values(Some(["local", "container_auto", "container_reference"])),
                     )
                     .required("type"),
             )
@@ -375,14 +406,25 @@ impl Serialize for ShellEnvironment {
     where
         S: serde::Serializer,
     {
-        let mut value = match self {
-            Self::Local(environment) => serde_json::to_value(environment).map_err(serde::ser::Error::custom)?,
+        let (mut value, kind) = match self {
+            Self::Local(environment) => (
+                serde_json::to_value(environment).map_err(serde::ser::Error::custom)?,
+                "local",
+            ),
+            Self::ContainerAuto(environment) => (
+                serde_json::to_value(environment).map_err(serde::ser::Error::custom)?,
+                "container_auto",
+            ),
+            Self::ContainerReference(environment) => (
+                serde_json::to_value(environment).map_err(serde::ser::Error::custom)?,
+                "container_reference",
+            ),
             Self::Unknown(value) => return value.serialize(serializer),
         };
         let object = value
             .as_object_mut()
             .ok_or_else(|| serde::ser::Error::custom("shell environment must serialize as an object"))?;
-        object.insert("type".to_owned(), Value::String("local".to_owned()));
+        object.insert("type".to_owned(), Value::String(kind.to_owned()));
         value.serialize(serializer)
     }
 }
@@ -392,17 +434,28 @@ impl<'de> Deserialize<'de> for ShellEnvironment {
     where
         D: serde::Deserializer<'de>,
     {
-        let mut value = Value::deserialize(deserializer)?;
-        if value.get("type").and_then(Value::as_str) != Some("local") {
-            return Ok(Self::Unknown(value));
-        }
-        value
+        let value = Value::deserialize(deserializer)?;
+        let kind = match value.get("type").and_then(Value::as_str) {
+            Some(kind @ ("local" | "container_auto" | "container_reference")) => kind.to_owned(),
+            _ => return Ok(Self::Unknown(value)),
+        };
+        let mut fields = value.clone();
+        fields
             .as_object_mut()
             .expect("a value with a string type field must be an object")
             .remove("type");
-        serde_json::from_value(value)
-            .map(Self::Local)
-            .map_err(serde::de::Error::custom)
+        let typed = match kind.as_str() {
+            "local" => serde_json::from_value(fields).map(Self::Local),
+            "container_auto" => serde_json::from_value(fields).map(Self::ContainerAuto),
+            _ => serde_json::from_value(fields).map(Self::ContainerReference),
+        };
+        match typed {
+            Ok(environment) => Ok(environment),
+            // A local environment must parse; other shapes are preserved so a
+            // later validation can reject them with a precise error.
+            Err(error) if kind == "local" => Err(serde::de::Error::custom(error)),
+            Err(_) => Ok(Self::Unknown(value)),
+        }
     }
 }
 
@@ -959,6 +1012,21 @@ mod tests {
         assert_eq!(serialized["environment"]["skills"][0]["name"], "repo");
         assert_eq!(serialized["allowed_callers"][0], "assistant");
         assert_eq!(serialized["future_tool_field"], true);
+    }
+
+    #[test]
+    fn responses_tool_shell_types_hosted_environments() {
+        for json in [
+            serde_json::json!({"type": "shell", "environment": {"type": "container_auto"}}),
+            serde_json::json!({"type": "shell", "environment": {"type": "container_reference", "container_id": "cntr_1"}}),
+        ] {
+            let tool: ResponsesTool = serde_json::from_value(json.clone()).unwrap();
+            let ResponsesTool::Shell(param) = &tool else {
+                panic!("expected shell");
+            };
+            assert!(param.environment.is_hosted());
+            assert_eq!(serde_json::to_value(tool).unwrap(), json);
+        }
     }
 
     #[test]

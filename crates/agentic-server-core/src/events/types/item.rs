@@ -97,7 +97,8 @@ impl TryFrom<&OutputItem> for SSEItemType {
             OutputItem::MultiAgentCall(_) => Ok(Self::MultiAgentCall),
             OutputItem::MultiAgentCallOutput(_) => Ok(Self::MultiAgentCallOutput),
             OutputItem::AgentMessage(_) => Ok(Self::AgentMessage),
-            OutputItem::Unknown => Err(()),
+            // Gateway-only item; never ingested from an upstream stream.
+            OutputItem::ShellCallOutput(_) | OutputItem::Unknown => Err(()),
         }
     }
 }

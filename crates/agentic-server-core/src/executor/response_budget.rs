@@ -501,6 +501,7 @@ impl RetainedSize for OutputItem {
             Self::CodeInterpreterCall(item) => item.retained_bytes(),
             Self::CustomToolCall(item) => item.retained_bytes(),
             Self::ShellCall(item) => item.retained_bytes(),
+            Self::ShellCallOutput(item) => item.retained_bytes(),
             Self::Reasoning(item) => item.retained_bytes(),
             Self::ToolSearchCall(item) => item.retained_bytes(),
             Self::WebSearchCall(item) => item.retained_bytes(),
