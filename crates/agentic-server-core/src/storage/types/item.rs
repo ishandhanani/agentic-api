@@ -7,11 +7,12 @@ use serde_json::Value;
 
 use crate::storage::StorageError;
 use crate::types::io::code_interpreter::CodeInterpreterCallOrigin;
-use crate::types::io::{InputItem, OutputItem, ResponsesInput};
+use crate::types::io::{InputItem, OutputItem, ResponsesInput, ShellItemOrigin};
 use crate::utils::common::serialize_to_value;
 
 pub(crate) const STORED_ITEM_KIND_KEY: &str = "_agentic_item_kind";
 pub(crate) const STORED_CODE_INTERPRETER_ORIGIN_KEY: &str = "_agentic_code_interpreter_origin";
+pub(crate) const STORED_GATEWAY_SHELL_ORIGIN_KEY: &str = "_agentic_gateway_shell_origin";
 
 /// Item kind (input vs output) for storage and retrieval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +105,17 @@ impl TryFrom<&InOutItem> for String {
             ) {
                 obj.insert(
                     STORED_CODE_INTERPRETER_ORIGIN_KEY.to_owned(),
+                    Value::String("gateway".to_owned()),
+                );
+            }
+            let gateway_shell = match item {
+                InOutItem::Output(OutputItem::ShellCall(call)) => call.origin == ShellItemOrigin::Gateway,
+                InOutItem::Output(OutputItem::ShellCallOutput(output)) => output.origin == ShellItemOrigin::Gateway,
+                _ => false,
+            };
+            if gateway_shell {
+                obj.insert(
+                    STORED_GATEWAY_SHELL_ORIGIN_KEY.to_owned(),
                     Value::String("gateway".to_owned()),
                 );
             }
@@ -273,6 +285,7 @@ mod tests {
             },
             status: Some(ShellCallStatus::Completed),
             extra: std::collections::HashMap::new(),
+            origin: crate::types::io::ShellItemOrigin::Client,
         };
 
         let inputs = InOutItem::into_input_items(vec![InOutItem::Output(OutputItem::ShellCall(call))]);

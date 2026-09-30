@@ -37,6 +37,9 @@ pub(super) struct GatewayCallResult {
     pub(super) item_index: usize,
     pub(super) input_item: InputItem,
     pub(super) public_output: Option<OutputItem>,
+    /// Paired public items, such as `shell_call_output`, placed after all of
+    /// the round's items so earlier output indexes never shift.
+    pub(super) trailing_outputs: Vec<OutputItem>,
 }
 
 /// Supplies the public output that completes a gateway event plan.
@@ -254,6 +257,7 @@ impl GatewayScheduler {
                 item_index,
                 input_item: InputItem::FunctionCallOutput(output.into()),
                 public_output: None,
+                trailing_outputs: Vec::new(),
             });
         };
 
@@ -264,7 +268,7 @@ impl GatewayScheduler {
         let _execution_slot = execution_slots.acquire().await.expect("semaphore is never closed");
         let _materialization_permit = self.policy.acquire_materialization_permit().await;
 
-        let dispatched = if self.timeout.is_zero() {
+        let dispatched = if self.timeout.is_zero() || binding.manages_own_deadline() {
             binding.execute(&call.call_id, &call.name, &call.arguments).await
         } else {
             match tokio::time::timeout(
@@ -294,10 +298,12 @@ impl GatewayScheduler {
         enforce_gateway_tool_output_size(output.output.len())?;
         response_budget.consume(output.output.len())?;
         let public_output = binding.public_output(&call, &output, status);
+        let trailing_outputs = binding.trailing_public_outputs(&call, &output, status);
         Ok(GatewayCallResult {
             item_index,
             input_item: InputItem::FunctionCallOutput(output.into()),
             public_output,
+            trailing_outputs,
         })
     }
 }
@@ -324,6 +330,46 @@ fn execution_error_output(call: &FunctionToolCall, message: &str) -> ExecutorRes
 }
 
 pub(super) fn public_output_items(
+    output_items: &[OutputItem],
+    registry: &ToolRegistry,
+    gateway_results: &[GatewayCallResult],
+) -> ExecutorResult<Vec<OutputItem>> {
+    let mut items = in_place_public_output_items(output_items, registry, gateway_results)?;
+    items.extend(trailing_output_items(gateway_results));
+    Ok(items)
+}
+
+/// Paired public items emitted after the round, in call order.
+pub(super) fn trailing_output_items(gateway_results: &[GatewayCallResult]) -> impl Iterator<Item = OutputItem> + '_ {
+    gateway_results
+        .iter()
+        .flat_map(|result| result.trailing_outputs.iter().cloned())
+}
+
+/// Emits added/done lifecycles for a round's trailing items, which follow
+/// every item of the round.
+pub(super) async fn emit_trailing_output_events(
+    gateway_results: &[GatewayCallResult],
+    first_index: usize,
+    stream_accumulator: &mut GatewayStreamAccumulator,
+    stream_sender: &tokio::sync::mpsc::Sender<StreamEvent>,
+) -> ExecutorResult<()> {
+    for (offset, item) in trailing_output_items(gateway_results).enumerate() {
+        let output_index = u32::try_from(first_index.saturating_add(offset)).unwrap_or(u32::MAX);
+        emit_gateway_added_event(output_index, &item, stream_accumulator, stream_sender).await?;
+        let mut done_event = synthetic_event(
+            SSEEventType::OutputItemDone,
+            [
+                ("output_index".to_owned(), serde_json::json!(output_index)),
+                ("item".to_owned(), output_item_value(&item)?),
+            ],
+        )?;
+        emit_gateway_event(&mut done_event, stream_accumulator, stream_sender).await?;
+    }
+    Ok(())
+}
+
+fn in_place_public_output_items(
     output_items: &[OutputItem],
     registry: &ToolRegistry,
     gateway_results: &[GatewayCallResult],
@@ -603,6 +649,7 @@ pub(super) async fn emit_gateway_start_events<'a>(
             | OutputItem::ToolSearchCall(_)
             | OutputItem::CustomToolCall(_)
             | OutputItem::ShellCall(_)
+            | OutputItem::ShellCallOutput(_)
             | OutputItem::Reasoning(_)
             | OutputItem::Compaction(_)
             | OutputItem::MultiAgentCall(_)
@@ -649,12 +696,16 @@ pub(super) async fn emit_gateway_completed_events<'a, T: GatewayPublicOutputSour
                 },
                 list_tools.id.as_str(),
             )),
-            OutputItem::CodeInterpreterCall(_) | OutputItem::Compaction(_) | OutputItem::ShellCall(_) => None,
+            // Gateway reasoning is a sealed shell history carrier.
+            OutputItem::CodeInterpreterCall(_)
+            | OutputItem::Compaction(_)
+            | OutputItem::ShellCall(_)
+            | OutputItem::ShellCallOutput(_)
+            | OutputItem::Reasoning(_) => None,
             OutputItem::Message(_)
             | OutputItem::FunctionCall(_)
             | OutputItem::ToolSearchCall(_)
             | OutputItem::CustomToolCall(_)
-            | OutputItem::Reasoning(_)
             | OutputItem::MultiAgentCall(_)
             | OutputItem::MultiAgentCallOutput(_)
             | OutputItem::AgentMessage(_)
@@ -713,6 +764,13 @@ pub(super) async fn execute_and_emit_output_calls(
         emit_gateway_completed_events(
             &gateway_results,
             scheduler.event_plans(),
+            stream_accumulator,
+            stream_sender,
+        )
+        .await?;
+        emit_trailing_output_events(
+            &gateway_results,
+            output_offset.saturating_add(output_items.len()),
             stream_accumulator,
             stream_sender,
         )
@@ -1897,6 +1955,7 @@ mod tests {
                 .into(),
             ),
             public_output: Some(final_item),
+            trailing_outputs: Vec::new(),
         }];
 
         super::complete_gateway_event_plans(&mut plans, &results);
@@ -1961,6 +2020,7 @@ mod tests {
                 None,
                 Some(crate::types::io::McpCallError::tool_execution("boom")),
             ))),
+            trailing_outputs: Vec::new(),
         }];
         let (sender, mut receiver) = mpsc::channel(32);
         let mut stream_accumulator = crate::executor::gateway_accumulator::GatewayStreamAccumulator::new();

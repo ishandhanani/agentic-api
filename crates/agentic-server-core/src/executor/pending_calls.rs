@@ -234,6 +234,7 @@ mod tests {
             },
             status: None,
             extra: std::collections::HashMap::new(),
+            origin: crate::types::io::ShellItemOrigin::Client,
         })
     }
 
@@ -245,6 +246,7 @@ mod tests {
             output: Vec::new(),
             status: None,
             extra: std::collections::HashMap::new(),
+            origin: crate::types::io::ShellItemOrigin::Client,
         })
     }
 

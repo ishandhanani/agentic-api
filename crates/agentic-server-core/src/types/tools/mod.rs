@@ -9,8 +9,9 @@ pub mod params;
 
 pub use code_interpreter::{CodeInterpreterCallArguments, CodeInterpreterCallArgumentsError};
 pub use params::{
-    CodeInterpreterToolParam, CodexNamespaceMember, CodexNamespaceToolParam, CustomToolParam, EmptyToolNameError,
-    FileSearchToolParam, FunctionToolParam, LocalShellEnvironment, McpDiscoveredToolParam, McpToolParam,
-    NonEmptyToolName, ResponsesTool, ShellEnvironment, ShellToolParam, ToolSearchExecution, ToolSearchStatus,
-    ToolSearchToolParam, WebSearchContextSize, WebSearchFilters, WebSearchToolParam, WebSearchUserLocation,
+    CodeInterpreterToolParam, CodexNamespaceMember, CodexNamespaceToolParam, ContainerAutoShellEnvironment,
+    ContainerReferenceShellEnvironment, CustomToolParam, EmptyToolNameError, FileSearchToolParam, FunctionToolParam,
+    LocalShellEnvironment, McpDiscoveredToolParam, McpToolParam, NonEmptyToolName, ResponsesTool, ShellEnvironment,
+    ShellToolParam, ToolSearchExecution, ToolSearchStatus, ToolSearchToolParam, WebSearchContextSize, WebSearchFilters,
+    WebSearchToolParam, WebSearchUserLocation,
 };

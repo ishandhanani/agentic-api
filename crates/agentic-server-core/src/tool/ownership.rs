@@ -27,6 +27,15 @@ trait ErasedGatewayExecutor: Send + Sync {
         output: &ToolOutput,
         status: GatewayCallStatus,
     ) -> Option<OutputItem>;
+
+    fn trailing_public_outputs(
+        &self,
+        call: &FunctionToolCall,
+        output: &ToolOutput,
+        status: GatewayCallStatus,
+    ) -> Vec<OutputItem>;
+
+    fn manages_own_deadline(&self) -> bool;
 }
 
 struct TypedGatewayExecutor<E>
@@ -61,6 +70,20 @@ where
         status: GatewayCallStatus,
     ) -> Option<OutputItem> {
         self.executor.public_output(call, output, status, &self.params)
+    }
+
+    fn trailing_public_outputs(
+        &self,
+        call: &FunctionToolCall,
+        output: &ToolOutput,
+        status: GatewayCallStatus,
+    ) -> Vec<OutputItem> {
+        self.executor
+            .trailing_public_outputs(call, output, status, &self.params)
+    }
+
+    fn manages_own_deadline(&self) -> bool {
+        self.executor.manages_own_deadline()
     }
 }
 
@@ -119,6 +142,21 @@ impl GatewayBinding {
         status: GatewayCallStatus,
     ) -> Option<OutputItem> {
         self.executor.public_output(call, output, status)
+    }
+
+    #[must_use]
+    pub(crate) fn trailing_public_outputs(
+        &self,
+        call: &FunctionToolCall,
+        output: &ToolOutput,
+        status: GatewayCallStatus,
+    ) -> Vec<OutputItem> {
+        self.executor.trailing_public_outputs(call, output, status)
+    }
+
+    #[must_use]
+    pub(crate) fn manages_own_deadline(&self) -> bool {
+        self.executor.manages_own_deadline()
     }
 }
 

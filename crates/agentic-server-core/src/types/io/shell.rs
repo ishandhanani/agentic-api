@@ -24,6 +24,17 @@ impl From<crate::types::event::MessageStatus> for ShellCallStatus {
     }
 }
 
+/// Who executed a shell item. Gateway items are public projections of a
+/// canonical function call and output that are recorded separately, so they
+/// must not be replayed again as model input or treated as client work.
+/// Never serialized: callers cannot claim gateway execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShellItemOrigin {
+    #[default]
+    Client,
+    Gateway,
+}
+
 /// A supplied shell limit can be numeric or explicitly null.
 /// The enclosing `Option` distinguishes either case from an omitted field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +88,9 @@ pub struct ShellCall {
     pub status: Option<ShellCallStatus>,
     #[serde(default, flatten)]
     pub extra: HashMap<String, Value>,
+    #[serde(skip)]
+    #[cfg_attr(feature = "openapi", schema(ignore))]
+    pub origin: ShellItemOrigin,
 }
 
 /// Outcome of one command in a shell call output.
@@ -120,6 +134,9 @@ pub struct ShellCallOutputMessage {
     pub status: Option<ShellCallStatus>,
     #[serde(default, flatten)]
     pub extra: HashMap<String, Value>,
+    #[serde(skip)]
+    #[cfg_attr(feature = "openapi", schema(ignore))]
+    pub origin: ShellItemOrigin,
 }
 
 #[cfg(test)]

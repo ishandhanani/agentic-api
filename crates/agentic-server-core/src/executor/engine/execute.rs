@@ -9,13 +9,20 @@ use tracing::{Instrument as _, debug};
 
 use super::run_blocking;
 use super::streaming::run_stream;
+use crate::executor::error::ExecutorError;
 use crate::executor::error::ExecutorResult;
 use crate::executor::inference::BoxStream;
 use crate::executor::prepare::prepare_request_tools;
 use crate::executor::rehydrate::validate_reasoning_for_vllm;
 use crate::executor::request::ExecutionContext;
 use crate::executor::telemetry::{Api, ExecutionSpan, Route};
+use crate::tool::gateway_shell::is_sealed_shell_carrier;
+use crate::tool::{GatewayExecutionPolicy, ShellEnvironmentSelection};
+use crate::types::io::ResponsesInput;
 use crate::types::request_response::{RequestPayload, ResponsePayload};
+use crate::types::tools::{
+    ContainerAutoShellEnvironment, ContainerReferenceShellEnvironment, ResponsesTool, ShellEnvironment, ShellToolParam,
+};
 
 /// Builder for a stateful conversation turn.
 ///
@@ -58,6 +65,15 @@ impl ExecuteRequest {
         let configured = self.exec_ctx.responses_config.max_stream_event_bytes;
         self.max_stream_event_bytes
             .map_or(configured, |transport| transport.min(configured))
+    }
+
+    /// Attach the trusted execution policy established by the embedding
+    /// application for this request (for example by its authentication layer).
+    /// Without a policy every `shell` declaration stays client-executed.
+    #[must_use]
+    pub fn with_execution_policy(mut self, policy: Option<Arc<GatewayExecutionPolicy>>) -> Self {
+        self.payload.execution_policy = policy;
+        self
     }
 
     /// Override the bearer token for this request only; does not touch the shared [`ExecutionContext`].
@@ -126,13 +142,16 @@ impl ExecuteRequest {
             "executor received responses request"
         );
         let max_stream_event_bytes = self.effective_max_stream_event_bytes();
+        let mut payload = self.payload;
+        if let Err(error) = apply_execution_policy(&mut payload, &self.exec_ctx).await {
+            execution.failed(&error);
+            execution.not_delivered();
+            return Err(error);
+        }
         let prepared = async {
-            let ctx = crate::executor::rehydrate::rehydrate_with_continuation(
-                self.payload,
-                &self.exec_ctx,
-                self.continuation,
-            )
-            .await?;
+            let ctx =
+                crate::executor::rehydrate::rehydrate_with_continuation(payload, &self.exec_ctx, self.continuation)
+                    .await?;
             if !ctx.enriched_request.input.has_compaction_trigger() {
                 validate_reasoning_for_vllm(&ctx.enriched_request.input)?;
             }
@@ -178,6 +197,88 @@ impl ExecuteRequest {
             }
         }
     }
+}
+
+/// Applies the trusted execution policy before any storage or inference work:
+/// declares granted gateway shell for callers that cannot declare it, and
+/// restores sealed gateway shell history the caller replayed.
+async fn apply_execution_policy(payload: &mut RequestPayload, exec_ctx: &ExecutionContext) -> ExecutorResult<()> {
+    let has_carriers = match &payload.input {
+        ResponsesInput::Items(items) => items.iter().any(is_sealed_shell_carrier),
+        ResponsesInput::Text(_) => false,
+    };
+    let Some(policy) = payload.execution_policy.clone() else {
+        if has_carriers {
+            return Err(ExecutorError::InvalidRequest(
+                "gateway shell history can only be replayed by an authenticated caller".to_owned(),
+            ));
+        }
+        return Ok(());
+    };
+    if let Some(selection) = policy.shell.as_ref().and_then(|grant| grant.declare.as_ref()) {
+        let tools = payload.tools.get_or_insert_with(Vec::new);
+        if !tools.iter().any(|tool| matches!(tool, ResponsesTool::Shell(_))) {
+            let environment = match selection {
+                ShellEnvironmentSelection::Auto => {
+                    ShellEnvironment::ContainerAuto(ContainerAutoShellEnvironment::default())
+                }
+                ShellEnvironmentSelection::Reference { container_id } => {
+                    ShellEnvironment::ContainerReference(ContainerReferenceShellEnvironment {
+                        container_id: container_id.clone(),
+                        extra: std::collections::HashMap::new(),
+                    })
+                }
+            };
+            tools.push(ResponsesTool::Shell(ShellToolParam {
+                environment,
+                allowed_callers: None,
+                extra: std::collections::HashMap::new(),
+            }));
+        }
+    }
+    authorize_hosted_shell(payload, exec_ctx, &policy).await?;
+    if has_carriers {
+        let executor = exec_ctx.gateway_executors.shell_executor().ok_or_else(|| {
+            ExecutorError::InvalidRequest("gateway shell history requires a configured shell backend".to_owned())
+        })?;
+        if let ResponsesInput::Items(items) = &mut payload.input {
+            let restored = executor
+                .unseal(&policy.subject, items)
+                .map_err(ExecutorError::InvalidRequest)?;
+            debug!(restored, "restored sealed gateway shell history");
+        }
+    }
+    Ok(())
+}
+
+/// Authorizes every declared hosted shell environment before any response
+/// bytes are sent, so an unauthorized caller receives an explicit request
+/// error rather than a failed stream. The registry authorizes again, which
+/// also covers declarations inherited from stored state.
+async fn authorize_hosted_shell(
+    payload: &RequestPayload,
+    exec_ctx: &ExecutionContext,
+    policy: &GatewayExecutionPolicy,
+) -> ExecutorResult<()> {
+    let hosted = payload.tools.iter().flatten().filter_map(|tool| match tool {
+        ResponsesTool::Shell(param) if param.environment.is_hosted() => Some(&param.environment),
+        _ => None,
+    });
+    for environment in hosted {
+        let executor = exec_ctx.gateway_executors.shell_executor().ok_or_else(|| {
+            ExecutorError::InvalidRequest(
+                "hosted shell environments require a configured gateway shell backend".to_owned(),
+            )
+        })?;
+        let grant = policy.shell.as_ref().ok_or_else(|| {
+            ExecutorError::InvalidRequest("this caller is not granted gateway shell execution".to_owned())
+        })?;
+        executor
+            .bind(policy, grant, environment, "preflight")
+            .await
+            .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Execute one stateful conversation turn.

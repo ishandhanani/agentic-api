@@ -237,6 +237,10 @@ pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
     pub cache_salt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Vec<ContextManagement>>,
+    /// Trusted execution policy installed by the embedding application.
+    /// Never read from or written to the wire, and never persisted.
+    #[serde(skip)]
+    pub execution_policy: Option<std::sync::Arc<crate::tool::GatewayExecutionPolicy>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,6 +297,15 @@ pub enum UpstreamTool {
 }
 
 impl<T: ?Sized> RequestPayload<T> {
+    /// Whether the input replays sealed gateway shell history.
+    #[must_use]
+    pub fn has_sealed_shell_history(&self) -> bool {
+        match &self.input {
+            ResponsesInput::Items(items) => items.iter().any(crate::tool::gateway_shell::is_sealed_shell_carrier),
+            ResponsesInput::Text(_) => false,
+        }
+    }
+
     /// Names the feature in this request that only the in-process executor
     /// implements, if any — neither the passthrough proxy nor split execution
     /// can serve it.
@@ -360,6 +373,7 @@ impl<T: ?Sized> RequestPayload<T> {
             multi_agent: self.multi_agent,
             cache_salt: self.cache_salt,
             context_management: self.context_management,
+            execution_policy: self.execution_policy,
         })
     }
 }

@@ -16,8 +16,8 @@ use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::gateway::history::append_input_item;
 use crate::executor::gateway::{
     GatewayCallResult, GatewayScheduler, append_gateway_calls_to_new_input, append_output_items_to_input,
-    append_tool_outputs, emit_gateway_completed_events, emit_gateway_start_events, execute_and_emit_output_calls,
-    has_client_owned_calls, public_output_items,
+    append_tool_outputs, emit_gateway_completed_events, emit_gateway_start_events, emit_trailing_output_events,
+    execute_and_emit_output_calls, has_client_owned_calls, public_output_items,
 };
 use crate::executor::pipeline::{AgentPipeline, emit_deferred_stream_events};
 use crate::executor::rehydrate::prepare_reasoning_for_vllm;
@@ -85,7 +85,10 @@ pub(super) async fn build_tool_registry(
     exec_ctx: &ExecutionContext,
     response_budget: &ExecutorResponseBudget,
 ) -> ExecutorResult<ToolRegistry> {
-    let mut executors = exec_ctx.gateway_executors.request_scoped();
+    let mut executors = exec_ctx.gateway_executors.request_scoped(
+        agent.request.enriched_request.execution_policy.clone(),
+        &agent.request.response_id,
+    );
     let mut registry: ToolRegistry = match agent.request.enriched_request.tools.as_mut() {
         Some(tools) => {
             let policy = exec_ctx.gateway_scheduler_policy.clone();
@@ -340,7 +343,9 @@ impl<'a> AgentTurn<'a> {
             let client_calls: HashMap<_, _> = public
                 .iter()
                 .filter_map(|item| match item {
-                    OutputItem::ShellCall(call) => Some((call.call_id.as_str(), item)),
+                    OutputItem::ShellCall(call) if call.origin != crate::types::io::ShellItemOrigin::Gateway => {
+                        Some((call.call_id.as_str(), item))
+                    }
                     OutputItem::CustomToolCall(call) => Some((call.call_id.as_str(), item)),
                     OutputItem::ToolSearchCall(call) => Some((call.call_id.as_str(), item)),
                     _ => None,
@@ -460,6 +465,13 @@ impl<'a> AgentTurn<'a> {
             .await?;
         }
         emit_deferred_stream_events(remaining_events, ctx, stream_accumulator, stream_sender, output_offset).await?;
+        emit_trailing_output_events(
+            &gateway_results,
+            output_offset.saturating_add(output_items.len()),
+            stream_accumulator,
+            stream_sender,
+        )
+        .await?;
         Ok(gateway_results)
     }
 }
@@ -489,6 +501,7 @@ mod tests {
             item_index: 0,
             input_item: InputItem::Unknown,
             public_output: None,
+            trailing_outputs: Vec::new(),
         }];
         assert!(matches!(
             classify_round(true, &results, 0, 1),

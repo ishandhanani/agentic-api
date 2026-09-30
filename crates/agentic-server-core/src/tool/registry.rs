@@ -103,6 +103,16 @@ impl ToolEntry {
         }
     }
 
+    /// Builds a gateway-executed `shell` entry. Shell is client-owned by
+    /// default; only a trusted grant plus a registered backend produce this.
+    pub(crate) fn gateway_shell(binding: GatewayBinding) -> Self {
+        Self {
+            tool_type: ToolType::Shell,
+            server_label: None,
+            ownership: ToolOwnership::Gateway(Some(binding)),
+        }
+    }
+
     /// Builds a gateway-owned entry. `binding` is `None` for tool types that
     /// are gateway-owned in principle but have no executor yet.
     pub(crate) fn gateway(tool_type: ToolType, server_label: Option<String>, binding: Option<GatewayBinding>) -> Self {
@@ -171,6 +181,26 @@ fn insert_code_interpreter_entry(
             ),
         );
     })
+}
+
+/// Hosted environments bind to the trusted gateway shell grant; every other
+/// declaration stays client-executed.
+async fn insert_shell_declaration(
+    entries: &mut HashMap<String, ToolEntry>,
+    executors: &GatewayExecutors,
+    param: &crate::types::tools::ShellToolParam,
+) -> Result<(), ToolError> {
+    if param.environment.is_hosted() {
+        let binding = executors.shell_binding(param).await?;
+        insert_unique_tool_entries(entries, |resolved| {
+            resolved.insert(
+                super::shell::SHELL_FUNCTION_NAME.to_owned(),
+                ToolEntry::gateway_shell(binding),
+            );
+        })
+    } else {
+        insert_unique_tool_entries(entries, insert_shell_entry)
+    }
 }
 
 /// Request-scoped registry built from `RequestPayload.tools`.
@@ -323,11 +353,7 @@ impl ToolRegistry {
                 ResponsesTool::CodeInterpreter(param) => {
                     insert_code_interpreter_entry(&mut entries, executors, param)?;
                 }
-                ResponsesTool::Shell(_) => {
-                    insert_unique_tool_entries(&mut entries, |resolved| {
-                        insert_shell_entry(resolved);
-                    })?;
-                }
+                ResponsesTool::Shell(param) => insert_shell_declaration(&mut entries, executors, param).await?,
                 ResponsesTool::Namespace(p) => {
                     insert_unique_tool_entries(&mut entries, |resolved| insert_namespace_entries(resolved, p))?;
                 }

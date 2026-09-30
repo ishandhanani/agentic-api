@@ -930,6 +930,10 @@ pub enum OutputItem {
     CustomToolCall(CustomToolCall),
     #[serde(rename = "shell_call")]
     ShellCall(ShellCall),
+    /// Output of a gateway-executed shell call. Client-executed shell output
+    /// arrives as input and is never emitted by the gateway.
+    #[serde(rename = "shell_call_output")]
+    ShellCallOutput(super::shell::ShellCallOutputMessage),
     #[serde(rename = "web_search_call")]
     WebSearchCall(WebSearchCall),
     #[serde(rename = "mcp_call")]
@@ -974,6 +978,7 @@ impl utoipa::PartialSchema for OutputItem {
             .item(tagged("tool_search_call", "ToolSearchCall"))
             .item(tagged("custom_tool_call", "CustomToolCall"))
             .item(tagged("shell_call", "ShellCall"))
+            .item(tagged("shell_call_output", "ShellCallOutputMessage"))
             .item(tagged("web_search_call", "WebSearchCall"))
             .item(tagged("mcp_call", "McpCall"))
             .item(tagged("mcp_list_tools", "McpListTools"))
@@ -1010,7 +1015,7 @@ impl OutputItem {
             Self::McpListTools(item) => item.agent.as_ref(),
             Self::Reasoning(item) => item.agent.as_ref(),
             Self::Compaction(item) => item.agent.as_ref(),
-            Self::Unknown => None,
+            Self::ShellCallOutput(_) | Self::Unknown => None,
         }
     }
 
@@ -1031,7 +1036,7 @@ impl OutputItem {
             Self::McpListTools(item) => &mut item.agent,
             Self::Reasoning(item) => &mut item.agent,
             Self::Compaction(item) => &mut item.agent,
-            Self::Unknown => return,
+            Self::ShellCallOutput(_) | Self::Unknown => return,
         };
         *slot = Some(agent);
     }
@@ -1042,8 +1047,10 @@ impl OutputItem {
             Self::FunctionCall(call) => registry
                 .lookup(&call.name)
                 .is_none_or(|entry| !entry.ownership.is_gateway()),
-            Self::ToolSearchCall(_) | Self::CustomToolCall(_) | Self::ShellCall(_) => true,
-            Self::Message(_)
+            Self::ShellCall(call) => call.origin != super::shell::ShellItemOrigin::Gateway,
+            Self::ToolSearchCall(_) | Self::CustomToolCall(_) => true,
+            Self::ShellCallOutput(_)
+            | Self::Message(_)
             | Self::CodeInterpreterCall(_)
             | Self::WebSearchCall(_)
             | Self::McpCall(_)
@@ -1065,10 +1072,12 @@ impl OutputItem {
     pub fn to_input_item(&self) -> Option<InputItem> {
         match self {
             Self::Message(message) => Some(InputItem::Message(message.clone().into())),
+            Self::Reasoning(reasoning) if crate::tool::gateway_shell::is_sealed_reasoning(reasoning) => None,
             Self::Reasoning(reasoning) => Some(InputItem::Reasoning(reasoning.clone())),
             Self::FunctionCall(call) => Some(InputItem::FunctionCall(InputFunctionToolCall::from(call.clone()))),
             Self::ToolSearchCall(call) => InputToolSearchCall::try_from(call).ok().map(InputItem::ToolSearchCall),
             Self::CustomToolCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
+            Self::ShellCall(call) if call.origin == super::shell::ShellItemOrigin::Gateway => None,
             Self::ShellCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
             Self::McpListTools(list_tools) => Some(InputItem::McpListTools(list_tools.clone())),
             Self::Compaction(item) => Some(InputItem::Compaction(item.clone())),
@@ -1080,7 +1089,11 @@ impl OutputItem {
             Self::MultiAgentCall(item) => Some(InputItem::MultiAgentCall(item.clone().into())),
             Self::MultiAgentCallOutput(item) => Some(InputItem::MultiAgentCallOutput(item.clone().into())),
             Self::AgentMessage(item) => Some(InputItem::AgentMessage(item.clone().into())),
-            Self::CodeInterpreterCall(_) | Self::WebSearchCall(_) | Self::McpCall(_) | Self::Unknown => None,
+            Self::CodeInterpreterCall(_)
+            | Self::WebSearchCall(_)
+            | Self::McpCall(_)
+            | Self::ShellCallOutput(_)
+            | Self::Unknown => None,
         }
     }
 }

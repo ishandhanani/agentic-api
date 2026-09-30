@@ -399,6 +399,7 @@ mod tests {
                 outcome: ShellCallOutcome::Exit { exit_code: 0 },
                 extra: HashMap::new(),
             }],
+            origin: crate::types::io::ShellItemOrigin::Client,
         })
     }
 

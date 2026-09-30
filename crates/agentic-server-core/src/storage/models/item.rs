@@ -6,7 +6,9 @@ use std::fmt::Write;
 use tracing::warn;
 
 use super::super::pool::{DbPool, DbResult, DbTransaction};
-use super::super::types::item::{InOutItem, ItemKind, STORED_CODE_INTERPRETER_ORIGIN_KEY, STORED_ITEM_KIND_KEY};
+use super::super::types::item::{
+    InOutItem, ItemKind, STORED_CODE_INTERPRETER_ORIGIN_KEY, STORED_GATEWAY_SHELL_ORIGIN_KEY, STORED_ITEM_KIND_KEY,
+};
 use crate::storage::{StorageError, StoreResult};
 use crate::types::conversations::ItemOrder;
 use crate::types::io::code_interpreter::CodeInterpreterCallOrigin;
@@ -56,10 +58,12 @@ impl Item {
 
     fn data_without_storage_marker(&self) -> Option<(Value, bool)> {
         let mut value = deserialize_from_str_opt::<Value>(&self.data)?;
-        let gateway_origin = value.get(STORED_CODE_INTERPRETER_ORIGIN_KEY).and_then(Value::as_str) == Some("gateway");
+        let gateway_origin = value.get(STORED_CODE_INTERPRETER_ORIGIN_KEY).and_then(Value::as_str) == Some("gateway")
+            || value.get(STORED_GATEWAY_SHELL_ORIGIN_KEY).and_then(Value::as_str) == Some("gateway");
         if let Some(object) = value.as_object_mut() {
             object.remove(STORED_ITEM_KIND_KEY);
             object.remove(STORED_CODE_INTERPRETER_ORIGIN_KEY);
+            object.remove(STORED_GATEWAY_SHELL_ORIGIN_KEY);
         }
         Some((value, gateway_origin))
     }
@@ -76,8 +80,13 @@ impl Item {
     pub fn as_output(&self) -> Option<OutputItem> {
         let (value, gateway_origin) = self.data_without_storage_marker()?;
         let mut output: OutputItem = serde_json::from_value(value).ok()?;
-        if gateway_origin && let OutputItem::CodeInterpreterCall(call) = &mut output {
-            call.origin = CodeInterpreterCallOrigin::Gateway;
+        if gateway_origin {
+            match &mut output {
+                OutputItem::CodeInterpreterCall(call) => call.origin = CodeInterpreterCallOrigin::Gateway,
+                OutputItem::ShellCall(call) => call.origin = crate::types::io::ShellItemOrigin::Gateway,
+                OutputItem::ShellCallOutput(output) => output.origin = crate::types::io::ShellItemOrigin::Gateway,
+                _ => {}
+            }
         }
         Some(output)
     }
